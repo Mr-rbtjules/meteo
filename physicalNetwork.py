@@ -72,3 +72,5 @@ class CombinedLoss(nn.Module):
         # Total Loss
         total_loss = data_loss + physics_loss
         return total_loss, data_loss, physics_loss
+    
+    
