@@ -21,6 +21,7 @@ class PhysNet(nn.Module):
         layers.append(nn.Linear(hidden_dim, output_dim))
         self.model = nn.Sequential(*layers)
     
+    #define how input go through the model (heritated from module)
     def forward(self, t):
         return self.model(t)
 
@@ -33,34 +34,35 @@ class CombinedLoss(nn.Module):
         self.rho = rho
         self.beta = beta
     
-    def forward(self, t, y_pred, y_true):
+    def forward(self, t, space_pred, space_true):
+        #y = space coord x,y,z
         # Data Loss
-        data_loss = self.mse_loss(y_pred, y_true)
+        data_loss = self.mse_loss(space_pred, space_true)
         
         # Compute derivatives using autograd
-        y_pred = y_pred.requires_grad_(True)
+        space_pred = space_pred.requires_grad_(True)
         dydt = torch.autograd.grad(
-            outputs=y_pred,
+            outputs=space_pred,
             inputs=t,
-            grad_outputs=torch.ones_like(y_pred),
+            grad_outputs=torch.ones_like(space_pred), #seed for autodiff
             create_graph=True,
             retain_graph=True,
             only_inputs=True
         )[0]  # Shape: (batch_size, 3)
         
         # Extract individual components
-        x_pred = y_pred[:, 0]
-        y_pred_var = y_pred[:, 1]
-        z_pred = y_pred[:, 2]
+        x_pred = space_pred[:, 0]
+        y_pred = space_pred[:, 1]
+        z_pred = space_pred[:, 2]
         
         dxdt_pred = dydt[:, 0]
         dydt_pred = dydt[:, 1]
         dzdt_pred = dydt[:, 2]
         
         # Define Lorenz ODEs
-        dxdt_lorenz = self.sigma * (y_pred_var - x_pred)
-        dydt_lorenz = x_pred * (self.rho - z_pred) - y_pred_var
-        dzdt_lorenz = x_pred * y_pred_var - self.beta * z_pred
+        dxdt_lorenz = self.sigma * (y_pred - x_pred)
+        dydt_lorenz = x_pred * (self.rho - z_pred) - y_pred
+        dzdt_lorenz = x_pred * y_pred - self.beta * z_pred
         
         # Physics Loss
         physics_loss_x = self.mse_loss(dxdt_pred, dxdt_lorenz)
@@ -72,5 +74,3 @@ class CombinedLoss(nn.Module):
         # Total Loss
         total_loss = data_loss + physics_loss
         return total_loss, data_loss, physics_loss
-    
-    

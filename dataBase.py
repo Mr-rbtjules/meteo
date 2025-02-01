@@ -2,26 +2,153 @@ import meteo_api as API
 from pathlib import Path
 import time
 import numpy as np
-from joblib import Parallel, delayed # type: ignore
+from joblib import Parallel, delayed  # type: ignore
 import os
 import h5py  # type: ignore
 from sklearn.model_selection import train_test_split  # type: ignore
 from sklearn.preprocessing import StandardScaler  # type: ignore
+import torch  # type: ignore
+from torch.utils.data import Dataset, DataLoader # type: ignore
 
-
-
-
-
-class DataBase:
-   
-    def __init__(
-            self
-    ) -> None:
-        self.saved_trajectory_path = \
-            Path(API.config.RAW_DATA_DIR) / "trajectories_dataset"
-        print("db object created")
-
-    def createDbFromScratch(self, output_dir,zones=100) -> None:
+class DataBase(Dataset):
+    def __init__(self, origin_path, num_zones=100, n_similar=100):
+        """
+        Initialize the DataBase class, load data, normalize, split, and prepare DataLoaders.
+        
+        Parameters:
+        - hdf5_dir (Path or str): Directory containing HDF5 trajectory files.
+        - num_zones (int): Number of zone files to process.
+        - n_similar (int): Number of trajectories per zone.
+        - test_size (float): Fraction of data to reserve for testing.
+        - random_state (int): Seed for reproducibility.
+        - batch_size (int): Number of samples per batch in DataLoader.
+        """
+        super(DataBase, self).__init__()
+        self.origin_path = Path(origin_path)
+        self.num_zones = num_zones #another name for nb of files in the directory , 1 if uniform
+        self.n_similar = n_similar
+        self.batch_size = API.config.BATCH_SIZE
+        
+        # Load and prepare data
+        self.time_var, self.space_coord = self.load_data()
+        self.time_normalized, self.space_normalized, self.scaler_time, self.scaler_space = self.normalize_data()
+        self.train_loader, self.test_loader = self.prepare_dataloaders()
+    
+    def load_data(self):
+        """
+        Load trajectories from HDF5 files and aggregate time and state data.
+        
+        Returns:
+        - tuple: (time_var, space_coord)
+            - time_var (numpy.ndarray): Time points, shape (N, 1)
+            - space_coord (numpy.ndarray): States [x, y, z], shape (N, 3)
+        """
+        time_var = []
+        space_coord = []
+        for type_idx in range(1, self.num_zones + 1):
+            file_path = self.origin_path / f"type_{type_idx:03d}.h5"
+            if not file_path.exists():
+                raise FileNotFoundError(f"HDF5 file not found: {file_path}")
+            
+            with h5py.File(file_path, 'r') as f:
+                trajectories = f['trajectories'][:]  # Shape: (n_similar, 3, traj_steps)
+                traj_steps = trajectories.shape[2]
+                t_span = (0, 100)
+                time_points = np.linspace(t_span[0], t_span[1], traj_steps)
+                
+                for sim in range(self.n_similar):
+                    traj = trajectories[sim]
+                    for t, state in zip(time_points, traj.T):
+                        time_var.append(t)
+                        space_coord.append(state)
+        
+        time_var = np.array(time_var).reshape(-1, 1)  # Shape: (N, 1)
+        space_coord = np.array(space_coord)           # Shape: (N, 3)
+        return time_var, space_coord
+    
+    def normalize_data(self):
+        """
+        Normalize time and state data using StandardScaler.
+        
+        Returns:
+        - tuple: (time_normalized, space_normalized, scaler_time, scaler_space)
+        """
+        scaler_time = StandardScaler()
+        scaler_space = StandardScaler()
+        time_normalized = scaler_time.fit_transform(self.time_var)
+        space_normalized = scaler_space.fit_transform(self.space_coord)
+        return time_normalized, space_normalized, scaler_time, scaler_space
+    
+    def prepare_dataloaders(self):
+        """
+        Split data into training and testing sets and create DataLoader instances.
+        
+        Returns:
+        - tuple: (train_loader, test_loader)
+            - train_loader (DataLoader): DataLoader for training data.
+            - test_loader (DataLoader): DataLoader for testing data.
+        """
+        # Train-test split
+        X_train, X_test, y_train, y_test = train_test_split(
+            self.time_normalized, self.space_normalized,
+            test_size=API.config.TEST_DATA_PROPORTION,
+            random_state=API.config.SEED_SHUFFLE
+        )
+        
+        # Convert to PyTorch tensors
+        X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+        y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+        X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+        y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
+        
+        # Create TensorDatasets
+        train_dataset = torch.utils.data.TensorDataset(X_train_tensor, y_train_tensor)
+        test_dataset = torch.utils.data.TensorDataset(X_test_tensor, y_test_tensor)
+        
+        # Create DataLoaders
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4)
+        test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4)
+        
+        print("Data normalized and split into training and testing sets.")
+        return train_loader, test_loader
+    
+    def __len__(self):
+        """
+        Return the total number of samples in the dataset.
+        """
+        return len(self.time_var)
+    
+    def __getitem__(self, idx):
+        """
+        Retrieve a single data point.
+        
+        Parameters:
+        - idx (int): Index of the data point.
+        
+        Returns:
+        - tuple: (input_time, target_state)
+        """
+        return self.time_normalized[idx], self.space_normalized[idx]
+    
+    def get_train_loader(self):
+        """
+        Get the DataLoader for training data.
+        
+        Returns:
+        - DataLoader: Training DataLoader.
+        """
+        return self.train_loader
+    
+    def get_test_loader(self):
+        """
+        Get the DataLoader for testing data.
+        
+        Returns:
+        - DataLoader: Testing DataLoader.
+        """
+        return self.test_loader
+    @classmethod
+    def createDbFromScratch(cls, output_dir,zones=100) -> None:
         sigma = 10.0
         rho = 28.0
         beta = 8.0 / 3.0
@@ -68,7 +195,7 @@ class DataBase:
         zones = 100
         # Parallel processing: Generate and store each type in parallel
         Parallel(n_jobs=-1)(
-            delayed(API.tools.generate_and_store_type)(
+            delayed(cls._generate_and_store_type)(
                 type_idx=type_idx + 1,  # Type indices start at 1
                 n_similar=n_similar,
                 initial_state_base=zone_centers[type_idx],
@@ -86,7 +213,8 @@ class DataBase:
         end_time = time.time()
         print(f"Generated and stored all trajectories in {end_time - start_time:.2f} seconds")
 
-    def generate_and_store_type(
+    @classmethod
+    def _generate_and_store_type(
             self, type_idx, n_similar, 
             initial_state_base, t_span,
             h, sigma, rho, beta, output_dir
@@ -129,76 +257,3 @@ class DataBase:
 
         print(f"Stored type {type_idx} with {n_similar} trajectories in {file_name}")
 
-    
-
-    def load_trajectory(self, file_path, trajectory_index=0):
-        """
-        Load a specific trajectory from an HDF5 file.
-
-        Parameters:
-        - file_path: Path to the HDF5 file.
-        - trajectory_index: Index of the trajectory to load (default is 0).
-
-        Returns:
-        - trajectory: NumPy array of shape (3, traj_steps) representing [x, y, z].
-        - metadata: Dictionary containing metadata for the trajectory.
-        """
-        with h5py.File(file_path, 'r') as f:
-            trajectories = f['trajectories'][:]  # Shape: (100, 3, traj_steps)
-            selected_traj = trajectories[trajectory_index]  # Shape: (3, traj_steps)
-            
-            # Load metadata
-            metadata = {}
-            for key in f['metadata']:
-                metadata[key] = f['metadata'][key][trajectory_index]
-        
-        return selected_traj, metadata
-    
-
-
-    def load_data(self, hdf5_dir, num_zones, n_similar):
-        """
-        Load trajectories from HDF5 files and prepare the dataset.
-        
-        Parameters:
-        - hdf5_dir: Directory containing HDF5 trajectory files.
-        - num_zones: Number of zone files.
-        - n_similar: Number of trajectories per zone.
-        
-        Returns:
-        - X: NumPy array of shape (N, 1) containing time points.
-        - y: NumPy array of shape (N, 3) containing [x, y, z].
-        """
-        X = []
-        y = []
-        for type_idx in range(1, num_zones + 1):
-            file_path = f"{hdf5_dir}/type_{type_idx:03d}.h5"
-            with h5py.File(file_path, 'r') as f:
-                trajectories = f['trajectories'][:]  # Shape: (n_similar, 3, traj_steps)
-                traj_steps = trajectories.shape[2]
-                t_span = (0, 100)  # Assuming same time span
-                h = 1e-5
-                time_points = np.linspace(t_span[0], t_span[1], traj_steps)
-                for sim in range(n_similar):
-                    traj = trajectories[sim]
-                    for t, state in zip(time_points, traj.T):
-                        X.append(t)
-                        y.append(state)
-        X = np.array(X).reshape(-1, 1)
-        y = np.array(y)
-        return X, y
-
-    def final_load(self):
-        # Load and prepare data
-        hdf5_directory =  Path(API.config.RAW_DATA_DIR) / "trajectories_dataset"  # Replace with your path
-        X, y = self.load_data(hdf5_directory, num_zones=1, n_similar=1)
-
-        # Normalize the data
-        scaler_X = StandardScaler()
-        scaler_y = StandardScaler()
-        X_normalized = scaler_X.fit_transform(X)
-        y_normalized = scaler_y.fit_transform(y)
-
-        # Train-test split
-        X_train, X_test, y_train, y_test = train_test_split(X_normalized, y_normalized, test_size=0.2, random_state=42)
-        print("normalized and splited")
