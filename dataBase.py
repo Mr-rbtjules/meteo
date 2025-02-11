@@ -1,5 +1,3 @@
-
-
 import meteo_api as API
 from pathlib import Path
 import time
@@ -13,218 +11,73 @@ import torch  # type: ignore
 from torch.utils.data import Dataset, DataLoader  # type: ignore
 import random
 
-class DataBase(Dataset):
-    def __init__(self, origin_path, num_zones=100, n_similar=100, context_fraction=0.5, train_zone_fraction=0.8):
+class TrajectoryDataset(Dataset):
+    """
+    A Dataset that splits each trajectory into a context portion and k query points.
+    """
+    def __init__(
+            self,
+            trajectories,
+            k_query=1,
+            context_fraction=0.5,
+            max_token=1e3
+        ):
         """
-        Modified DataBase for dual usage by hypernetwork and physics network.
-        
-        Each sample is a full trajectory that is split into:
-          - A context segment (e.g. first half of trajectory) for the hypernetwork.
-          - A query time and corresponding state for the physics network.
-        
-        Additionally, the zones (files) are pre-split into training and testing sets.
-        
         Parameters:
-          - origin_path (str or Path): Directory containing HDF5 trajectory files.
-          - num_zones (int): Total number of zone files.
-          - n_similar (int): Number of trajectories per zone.
-          - context_fraction (float): Fraction of a trajectory to use as context.
-          - train_zone_fraction (float): Fraction of zones used for training (the rest for testing).
+          - trajectories: a list of trajectory dictionaries (each with 'zone', 'time', 'state')
+          - k_query: number of query points to sample from the latter part of the trajectory
+          - context_fraction: fraction of the trajectory to use as the context
         """
-        super(DataBase, self).__init__()
-        self.origin_path = Path(origin_path)
-        self.num_zones = num_zones
-        self.n_similar = n_similar
-        self.context_fraction = context_fraction
-        self.batch_size = API.config.BATCH_SIZE
-        
-        # Load trajectories organized by zone
-        self.all_trajectories = self.load_trajectories()  # List of dicts with keys: 'zone', 'time', 'state'
-        
-        # Normalize time and state globally
-        self._normalize_trajectories()
-        
-        # Pre-split zones: reserve a fraction for training and the rest for testing
-        self.train_trajectories, self.test_trajectories = self.split_by_zone(train_zone_fraction)
-        
-    def load_trajectories(self):
-        """
-        Load full trajectories from each HDF5 file.
-        For each zone file, store each trajectory along with its zone id.
-        
-        Returns:
-          A list of dictionaries, one per trajectory, each with keys:
-            'zone': zone id (int)
-            'time': numpy.ndarray of shape (traj_steps, 1)
-            'state': numpy.ndarray of shape (traj_steps, 3)
-        """
-        trajectories_list = []
-        # Assume zone files are named "type_001.h5", ..., "type_{num_zones:03d}.h5"
-        for zone_idx in range(1, self.num_zones + 1):
-            file_path = self.origin_path / f"type_{zone_idx:03d}.h5"
-            if not file_path.exists():
-                raise FileNotFoundError(f"HDF5 file not found: {file_path}")
-            
-            with h5py.File(file_path, 'r') as f:
-                zone_trajs = f['trajectories'][:]  # Shape: (n_similar, 3, traj_steps)
-                traj_steps = zone_trajs.shape[2]
-                t_span = (0, 100)
-                # Create a time vector (reshaped as (traj_steps, 1))
-                time_points = np.linspace(t_span[0], t_span[1], traj_steps).reshape(-1, 1)
-                
-                # For each similar trajectory in this zone:
-                for sim in range(self.n_similar):
-                    traj = zone_trajs[sim]  # Shape: (3, traj_steps)
-                    traj = traj.T  # Now shape: (traj_steps, 3)
-                    trajectories_list.append({
-                        'zone': zone_idx,
-                        'time': time_points.copy(),  # (traj_steps, 1)
-                        'state': traj               # (traj_steps, 3)
-                    })
-        return trajectories_list
-    
-    def _normalize_trajectories(self):
-        """
-        Normalize time and state for all trajectories.
-        Uses StandardScaler on the concatenation of all data.
-        Stores the scalers as attributes.
-        """
-        all_time = np.concatenate([traj['time'] for traj in self.all_trajectories], axis=0)
-        all_state = np.concatenate([traj['state'] for traj in self.all_trajectories], axis=0)
-        
-        self.scaler_time = StandardScaler()
-        self.scaler_state = StandardScaler()
-        all_time_norm = self.scaler_time.fit_transform(all_time)
-        all_state_norm = self.scaler_state.fit_transform(all_state)
-        
-        # Reassign normalized values back to each trajectory
-        start_idx = 0
-        for traj in self.all_trajectories:
-            n_points = traj['time'].shape[0]
-            traj['time'] = all_time_norm[start_idx:start_idx + n_points]
-            traj['state'] = all_state_norm[start_idx:start_idx + n_points]
-            start_idx += n_points
-    
-    def split_by_zone(self, train_zone_fraction):
-        """
-        Split the trajectories into training and testing sets by zone.
-        For example, if train_zone_fraction is 0.8 and there are 100 zones,
-        use trajectories from zones 1-80 for training and 81-100 for testing.
-        
-        Returns:
-          (train_trajectories, test_trajectories): two lists of trajectory dicts.
-        """
-        # First, group trajectories by zone
-        zones = {}
-        for traj in self.all_trajectories:
-            zone = traj['zone']
-            if zone not in zones:
-                zones[zone] = []
-            zones[zone].append(traj)
-        
-        sorted_zones = sorted(zones.keys())
-        n_train_zones = int(len(sorted_zones) * train_zone_fraction)
-        train_zone_ids = sorted_zones[:n_train_zones]
-        test_zone_ids = sorted_zones[n_train_zones:]
-        
-        train_trajectories = []
-        test_trajectories = []
-        for zone_id, trajs in zones.items():
-            if zone_id in train_zone_ids:
-                train_trajectories.extend(trajs)
-            else:
-                test_trajectories.extend(trajs)
-        
-        print(f"Train zones: {train_zone_ids}")
-        print(f"Test zones: {test_zone_ids}")
-        return train_trajectories, test_trajectories
-    
-    def __len__(self):
-        """
-        Return the number of training trajectory samples.
-        (If using for training, we index into the training set.)
-        """
-        return len(self.train_trajectories)
-    
-    def __getitem__(self, idx):
-        """
-        For a given trajectory sample (from the training set), split it into:
-          - context: the first part of the trajectory (e.g., first context_fraction)
-          - query: a randomly chosen time point (and corresponding state) from the remainder.
-        
-        Returns a dictionary with:
-          'context_time': Tensor, shape (context_steps, 1)
-          'context_state': Tensor, shape (context_steps, 3)
-          'query_time': Tensor, scalar (or shape (1,))
-          'query_state': Tensor, shape (3,)
-          'zone': the zone id (optional, may be useful for analysis)
-        """
-        traj_sample = self.train_trajectories[idx]
-        time_arr = traj_sample['time']  # (traj_steps, 1)
-        state_arr = traj_sample['state']  # (traj_steps, 3)
-        traj_steps = time_arr.shape[0]
-        
-        # Determine context length
-        context_len = int(self.context_fraction * traj_steps)
-        # Ensure there's at least one query point
-        if context_len >= traj_steps - 1:
-            context_len = traj_steps - 2
-        
-        # Context: first context_len points
-        context_time = time_arr[:context_len]
-        context_state = state_arr[:context_len]
-        
-        # Query: randomly select one point from the remainder
-        query_idx = random.randint(context_len, traj_steps - 1)
-        query_time = time_arr[query_idx]   # shape (1,)
-        query_state = state_arr[query_idx]  # shape (3,)
-        
-        return {
-            'context_time': torch.tensor(context_time, dtype=torch.float32),
-            'context_state': torch.tensor(context_state, dtype=torch.float32),
-            'query_time': torch.tensor(query_time, dtype=torch.float32).squeeze(),  # scalar or (1,)
-            'query_state': torch.tensor(query_state, dtype=torch.float32),
-            'zone': traj_sample['zone']
-        }
-    
-    def get_train_loader(self):
-        """
-        Create a DataLoader for training trajectories.
-        """
-        return DataLoader(self, batch_size=self.batch_size, shuffle=True, num_workers=4)
-    
-    def get_test_loader(self):
-        """
-        Create a DataLoader for testing trajectories (from unseen zones).
-        Here, we define a simple Dataset that returns the full trajectory.
-        """
-        test_dataset = TrajectoryTestDataset(self.test_trajectories)
-        return DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4)
-    
-
-class TrajectoryTestDataset(Dataset):
-    """
-    A simple dataset to return the full trajectory for test samples.
-    You can use the full trajectory to generate context and queries as needed,
-    or evaluate continuous predictions.
-    """
-    def __init__(self, trajectories):
+        super(TrajectoryDataset, self).__init__()
         self.trajectories = trajectories
-    
+        self.k_query = k_query
+        self.context_fraction = context_fraction
+        self.max_token = max_token
+
     def __len__(self):
         return len(self.trajectories)
-    
-    def __getitem__(self, idx):
-        traj_sample = self.trajectories[idx]
-        return {
-            'time': torch.tensor(traj_sample['time'], dtype=torch.float32),
-            'state': torch.tensor(traj_sample['state'], dtype=torch.float32),
-            'zone': traj_sample['zone']
-        }
-    
-    def get_zone_ids(self):
-        return list({traj['zone'] for traj in self.trajectories})
 
+def __getitem__(self, idx):
+    traj_sample = self.trajectories[idx]
+    time_arr = traj_sample['time']    # shape: (traj_steps, 1)
+    state_arr = traj_sample['state']   # shape: (traj_steps, 3)
+    traj_steps = time_arr.shape[0]
+
+    # Determine the context length as a fraction of the total trajectory length.
+    context_len = int(self.context_fraction * traj_steps)
+    if context_len >= traj_steps - 1:
+        context_len = traj_steps - 2  # ensure at least one query point
+
+    # Obtain the context portion.
+    # Here we form a full context tensor by concatenating state and time.
+    # If you prefer [x, y, z, t] ordering, we concatenate state first, then time.
+    context_time = time_arr[:context_len]   # (context_len, 1)
+    context_state = state_arr[:context_len]   # (context_len, 3)
+    full_context = torch.cat([
+        torch.tensor(context_state, dtype=torch.float32), 
+        torch.tensor(context_time, dtype=torch.float32)
+    ], dim=-1)  # Resulting shape: (context_len, 4)
+
+    # If the number of context points is greater than max_token (e.g. 1000), sample evenly spaced indices.
+    if full_context.shape[0] > self.max_token:
+        indices = torch.linspace(0, full_context.shape[0] - 1, steps=int(self.max_token)).long()
+        context_sample = full_context[indices]  # Now shape: (max_token, 4)
+    else:
+        context_sample = full_context  # Use all available points if fewer than max_token
+
+    # Sample k_query query points from the remainder of the trajectory.
+    available = traj_steps - context_len
+    k = min(self.k_query, available)
+    query_indices = random.sample(range(context_len, traj_steps), k)
+    query_time = torch.tensor(time_arr[query_indices], dtype=torch.float32)   # shape: (k, 1)
+    query_state = torch.tensor(state_arr[query_indices], dtype=torch.float32)   # shape: (k, 3)
+
+    return {
+        'context': context_sample,     # shape: (max_token, 4) if full_context is long, otherwise (context_len, 4)
+        'query_time': query_time,        # shape: (k, 1)
+        'query_state': query_state,      # shape: (k, 3)
+        'zone': traj_sample['zone']
+    }
 
     @classmethod
     def createDbFromScratch(cls, output_dir, zones=100) -> None:
@@ -323,3 +176,142 @@ class TrajectoryTestDataset(Dataset):
                 f.create_dataset(f"metadata/{key}", data=value, compression=None)
         
         print(f"Stored type {type_idx} with {n_similar} trajectories in {file_name}")
+
+
+class DataBase:
+    """
+    The master database object.
+    
+    This object loads the raw data from HDF5 files, performs normalization,
+    groups trajectories by zone, and then creates three dataset objects:
+      - train_dataset: trajectories from training zones (using a fraction for training)
+      - test_within_dataset: trajectories from training zones reserved for testing (initial condition sensitivity)
+      - test_unseen_dataset: trajectories from unseen zones
+    """
+    def __init__(self, 
+                 k_query=1, 
+                 context_fraction=0.5,
+                 max_token=1e3,
+                 load_size=0.1
+        ):
+        self.load_size = load_size
+        self.origin_path = Path(API.config.RAW_DATA_DIR) / "trajectories_dataset/"
+        self.k_query = k_query
+        self.context_fraction = context_fraction
+        self.train_zone_fraction = 1 - API.config.TEST_DATA_PROPORTION
+        self.within_zone_test_fraction = API.config.TEST_DATA_PROPORTION
+        self.batch_size = API.config.BATCH_SIZE
+        self.max_token = max_token
+
+        # Load trajectories (grouped by zone)
+        self.zone2trajectories = self._load_trajectories()
+        
+        # Flatten list of trajectories (used for normalization)
+        self.all_trajectories = []
+        for zone, traj_list in self.zone2trajectories.items():
+            self.all_trajectories.extend(traj_list)
+        # Normalize globally
+        self._normalize_trajectories()
+        # Now split the dataset
+        self._split_dataset()
+
+    def _load_trajectories(self):
+        """
+        Load trajectories from HDF5 files.
+        Each file (named like "type_001.h5") corresponds to one zone.
+        Returns a dictionary mapping zone id to a list of trajectories.
+        """
+        zone2traj = {}
+        h5_files = list(self.origin_path.glob("type_*.h5"))
+        for file_path in h5_files:
+            # Assume filename format "type_###.h5"
+            zone_id = int(file_path.stem.split("_")[1])
+            with h5py.File(file_path, 'r') as f:
+                zone_trajs = f['trajectories'][:int(len(f['trajectories'])*self.load_size)]  # shape: (n_similar, 3, traj_steps)
+                traj_steps = zone_trajs.shape[2]
+                t_span = (0, 100)
+                # Create time vector if not stored
+                time_points = np.linspace(t_span[0], t_span[1], traj_steps).reshape(-1, 1)
+                traj_list = []
+                for sim in range(zone_trajs.shape[0]):
+                    traj = zone_trajs[sim].T  # (traj_steps, 3)
+                    traj_list.append({
+                        'zone': zone_id,
+                        'time': time_points.copy(),
+                        'state': traj
+                    })
+                zone2traj[zone_id] = traj_list
+        print("data Loaded")
+        return zone2traj
+
+    def _normalize_trajectories(self):
+        """
+        Normalize all trajectories globally using StandardScaler.
+        """
+        all_time = np.concatenate([traj['time'] for traj in self.all_trajectories], axis=0)
+        all_state = np.concatenate([traj['state'] for traj in self.all_trajectories], axis=0)
+        
+        self.scaler_time = StandardScaler()
+        self.scaler_state = StandardScaler()
+        all_time_norm = self.scaler_time.fit_transform(all_time)
+        all_state_norm = self.scaler_state.fit_transform(all_state)
+        
+        start_idx = 0
+        for traj in self.all_trajectories:
+            n_points = traj['time'].shape[0]
+            traj['time'] = all_time_norm[start_idx:start_idx + n_points]
+            traj['state'] = all_state_norm[start_idx:start_idx + n_points]
+            start_idx += n_points
+
+    def _split_dataset(self):
+        """
+        Create three lists of trajectories:
+          - train_list: trajectories from training zones for training.
+          - test_within_list: trajectories from training zones reserved as test samples (for initial condition sensitivity).
+          - test_unseen_list: trajectories from zones not used for training.
+        """
+        all_zones = sorted(self.zone2trajectories.keys())
+        n_train_zones = int(len(all_zones) * self.train_zone_fraction)
+        train_zone_ids = all_zones[:n_train_zones]
+        unseen_zone_ids = all_zones[n_train_zones:]
+
+        self.train_zone_ids = train_zone_ids
+        self.unseen_zone_ids = unseen_zone_ids
+
+        train_list = []
+        test_within_list = []
+        # Split trajectories within each training zone.
+        for zone in train_zone_ids:
+            trajs = self.zone2trajectories[zone]
+            train_trajs, test_trajs = train_test_split(trajs, 
+                                                       test_size=self.within_zone_test_fraction,
+                                                       random_state=API.config.SEED_SHUFFLE)
+            train_list.extend(train_trajs)
+            test_within_list.extend(test_trajs)
+
+        test_unseen_list = []
+        for zone in unseen_zone_ids:
+            test_unseen_list.extend(self.zone2trajectories[zone])
+
+        self.train_list = train_list
+        self.test_within_list = test_within_list
+        self.test_unseen_list = test_unseen_list
+
+    def get_train_loader(self, shuffle=True):
+        train_dataset = TrajectoryDataset(self.train_list, 
+                                          k_query=self.k_query, 
+                                          context_fraction=self.context_fraction)
+        return DataLoader(train_dataset, batch_size=self.batch_size, shuffle=shuffle, num_workers=4)
+
+    def get_test_within_loader(self, shuffle=False):
+        test_within_dataset = TrajectoryDataset(self.test_within_list, 
+                                                k_query=self.k_query, 
+                                                context_fraction=self.context_fraction)
+        return DataLoader(test_within_dataset, batch_size=self.batch_size, shuffle=shuffle, num_workers=4)
+
+    def get_test_unseen_loader(self, shuffle=False):
+        test_unseen_dataset = TrajectoryDataset(self.test_unseen_list, 
+                                                k_query=self.k_query, 
+                                                context_fraction=self.context_fraction)
+        return DataLoader(test_unseen_dataset, batch_size=self.batch_size, shuffle=shuffle, num_workers=4)
+
