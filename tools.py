@@ -7,7 +7,29 @@ import h5py  # type: ignore
 from pathlib import Path
 from itertools import product
 import matplotlib.pyplot as plt # type: ignore
+import torch # type: ignore
 
+def batched_linear(x, weight, bias):
+    """
+    x = batch of t for first layer, do this function for each layer
+    following by a relu fct
+    Performs a batched linear transformation.
+    x: Tensor of shape (B, N, in_features) or (B, in_features).
+    weight: Tensor of shape (B, out_features, in_features).
+    bias: Tensor of shape (B, out_features).
+    
+    Returns:
+        Tensor of shape (B, N, out_features) (or (B, out_features) if N==1).
+    """
+    # If x is 2D, add a singleton time dimension.
+    if x.dim() == 2:
+        x = x.unsqueeze(1)  # (B, 1, in_features)
+    # x: (B, N, in_features); weight: (B, out_features, in_features)
+    out = torch.bmm(x, weight.transpose(1, 2)) + bias.unsqueeze(1)
+    # Squeeze the time dimension if it is 1.
+    if out.size(1) == 1:
+        return out.squeeze(1)
+    return out
  
 
 ###LORENZ SIMULATION###

@@ -8,10 +8,11 @@ import torch.optim as optim # type: ignore
 import torch.nn.functional as F # type: ignore
 
 
-class DeepPhysiNet(nn.Module):
+class HybridNet(nn.Module):
     def __init__(self, seq_len=1000, input_dim=4, embed_dim=128,
                  num_layers=2, num_heads=4, physnet_hidden=64, num_tokens=1):
-        super(DeepPhysiNet, self).__init__()
+        super(HybridNet, self).__init__()
+        #create a Hypernetwork (transformers)
         self.hypernet = HyperNet(seq_len=seq_len,
                                  input_dim=input_dim,
                                  embed_dim=embed_dim,
@@ -19,6 +20,7 @@ class DeepPhysiNet(nn.Module):
                                  num_heads=num_heads,
                                  physnet_hidden=physnet_hidden,
                                  num_tokens=num_tokens)  # pass num_tokens if you decide to use more
+        #create a Physical Network (simple perceptron layers)
         self.physnet = PhysNet(physnet_hidden=physnet_hidden)
     
     def forward(self, context, t):
@@ -36,27 +38,7 @@ class DeepPhysiNet(nn.Module):
 #   HyperNetwork and PhysNet for Lorenz Toy    #
 ##############################################
 
-def batched_linear(x, weight, bias):
-    """
-    x = batch of t for first layer, do this function for each layer
-    following by a relu fct
-    Performs a batched linear transformation.
-    x: Tensor of shape (B, N, in_features) or (B, in_features).
-    weight: Tensor of shape (B, out_features, in_features).
-    bias: Tensor of shape (B, out_features).
-    
-    Returns:
-        Tensor of shape (B, N, out_features) (or (B, out_features) if N==1).
-    """
-    # If x is 2D, add a singleton time dimension.
-    if x.dim() == 2:
-        x = x.unsqueeze(1)  # (B, 1, in_features)
-    # x: (B, N, in_features); weight: (B, out_features, in_features)
-    out = torch.bmm(x, weight.transpose(1, 2)) + bias.unsqueeze(1)
-    # Squeeze the time dimension if it is 1.
-    if out.size(1) == 1:
-        return out.squeeze(1)
-    return out
+
 
 class HyperNet(nn.Module):
     """
@@ -223,30 +205,117 @@ class PhysNet(nn.Module):
     
     def forward(self, t, params):
         # Layer 1: (1 -> physnet_hidden)
-        x = batched_linear(t, params['l1_weight'], params['l1_bias'])
+        x = API.tools.batched_linear(t, params['l1_weight'], params['l1_bias'])
         x = F.gelu(x)
         x = self.norm1(x)
         
         # Layer 2: (physnet_hidden -> physnet_hidden)
-        x = batched_linear(x, params['l2_weight'], params['l2_bias'])
+        x = API.tools.batched_linear(x, params['l2_weight'], params['l2_bias'])
         x = F.gelu(x)
         x = self.norm2(x)
         
         # Layer 3: (physnet_hidden -> physnet_hidden)
-        x = batched_linear(x, params['l3_weight'], params['l3_bias'])
+        x = API.tools.batched_linear(x, params['l3_weight'], params['l3_bias'])
         x = F.gelu(x)
         x = self.norm3(x)
         
         # Layer 4: (physnet_hidden -> physnet_hidden)
-        x = batched_linear(x, params['l4_weight'], params['l4_bias'])
+        x = API.tools.batched_linear(x, params['l4_weight'], params['l4_bias'])
         x = F.gelu(x)
         x = self.norm4(x)
         
         # Output layer: (physnet_hidden -> 3)
-        out = batched_linear(x, params['out_weight'], params['out_bias'])
+        out = API.tools.batched_linear(x, params['out_weight'], params['out_bias'])
         return out
     
 
+class Coach:
+    """
+    Trainer class for joint training of the hypernetwork (which generates the physics network parameters)
+    and the physics network itself, with evaluation on test data to monitor overfitting.
+    """
+    def __init__(
+            self, model, train_loader, test_within_loader,
+            test_unseen_loader, loss_fn, optimizer, device
+        ):
+        """
+        Parameters:
+          - model: An instance of DeepPhysiNet.
+          - train_loader: DataLoader for the training set.
+          - test_within_loader: DataLoader for trajectories from training zones (reserved for testing initial condition sensitivity).
+          - test_unseen_loader: DataLoader for trajectories from unseen zones.
+          - loss_fn: HybridLoss (combines data and physics loss).
+          - optimizer: Optimizer (e.g., Adam) updating model parameters.
+          - device: Torch device ('cuda' or 'cpu').
+        """
+        self.model = model
+        self.train_loader = train_loader
+        self.test_within_loader = test_within_loader
+        self.test_unseen_loader = test_unseen_loader
+        self.loss_fn = loss_fn
+        self.optimizer = optimizer
+        self.device = device
+
+    def evaluate(self, loader):
+        """Evaluate the model on a given data loader and return the average loss."""
+        self.model.eval()
+        total_loss = 0.0
+        with torch.no_grad():
+            for batch in loader:
+                context = batch['context'].to(self.device)           # shape: (B, seq_len, 4)
+                query_time = batch['query_time'].to(self.device)         # shape: (B, k_query, 1)
+                query_state = batch['query_state'].to(self.device)       # shape: (B, k_query, 3)
+                
+                # Ensure query_time requires gradients (needed for physics loss via autograd)
+                query_time.requires_grad_()
+                
+                # Forward pass through the model (which internally trains the hypernetwork and physnet)
+                pred = self.model(context, query_time)
+                loss, _, _ = self.loss_fn(query_time, pred, query_state)
+                total_loss += loss.item()
+        avg_loss = total_loss / len(loader)
+        self.model.train()
+        return avg_loss
+
+    def train(self, num_epochs=100, save_path='deep_physinet.pth'):
+        """Train the model for a specified number of epochs and evaluate on test data each epoch."""
+        for epoch in range(num_epochs):
+            epoch_loss = 0.0
+            for batch in self.train_loader:
+                self.optimizer.zero_grad()
+                
+                # Retrieve batch data and send to device
+                context = batch['context'].to(self.device)
+                query_time = batch['query_time'].to(self.device)
+                query_state = batch['query_state'].to(self.device)
+                
+                # Mark query_time for gradient calculation (needed for the physics loss)
+                query_time.requires_grad_()
+                
+                # Forward pass: hypernetwork generates parameters and physnet produces the prediction.
+                pred = self.model(context, query_time)
+                
+                # Compute total loss (data loss + physics loss)
+                total_loss, data_loss, physics_loss = self.loss_fn(query_time, pred, query_state)
+                
+                # Backpropagation and optimizer step
+                total_loss.backward()
+                self.optimizer.step()
+                
+                epoch_loss += total_loss.item()
+            
+            avg_train_loss = epoch_loss / len(self.train_loader)
+            test_within_loss = self.evaluate(self.test_within_loader)
+            test_unseen_loss = self.evaluate(self.test_unseen_loader)
+            
+            print(f"Epoch [{epoch+1}/{num_epochs}] | "
+                  f"Train Loss: {avg_train_loss:.6f} | "
+                  f"Test Within Loss: {test_within_loss:.6f} | "
+                  f"Test Unseen Loss: {test_unseen_loss:.6f}")
+        
+        # Save the model after training
+        torch.save(self.model.state_dict(), save_path)
+        print(f"Model saved to {save_path}")
 
 class HybridLoss(nn.Module):
     def __init__(self, scaler_y, sigma=10.0, rho=28.0, beta=8.0/3.0):
