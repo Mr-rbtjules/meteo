@@ -31,20 +31,13 @@ class HybridNet(nn.Module):
         return pred
 
 
-#Hypernetwork class
-
-
-##############################################
-#   HyperNetwork and PhysNet for Lorenz Toy    #
-##############################################
-
-
 
 class HyperNet(nn.Module):
     """
-    A transformer‐based hyper‑network that generates the parameters for the physics network.
+    A transformer-based hyper-network that generates the parameters
+    (weights and biases) for the physics network.
     
-    The input to the hyper‑net is a batch of spatiotemporal context points (e.g., 1000 points,
+    The input to the hyper-net is a batch of spatiotemporal context points (e.g., 1000 points,
     each with [x, y, z, t]). The network first embeds the inputs (adding a fixed positional encoding),
     prepends a learnable token, and processes the sequence with a few transformer encoder layers.
     The final token is then used to output the weights and biases for each layer of the physics network.
@@ -56,17 +49,23 @@ class HyperNet(nn.Module):
       - Layer 4: Linear(physnet_hidden, physnet_hidden)
       - Output Layer: Linear(physnet_hidden, 3)
     """
-    def __init__(self, seq_len=1000, input_dim=4, embed_dim=128, num_layers=2, num_heads=4, physnet_hidden=64, num_tokens=1):
+    def __init__(
+            self, seq_len=1000, input_dim=4, embed_dim=128, num_layers=2,
+            num_heads=4, physnet_hidden=64, num_tokens=1
+        ):
         super(HyperNet, self).__init__()
-        self.seq_len = seq_len
-        self.embed_dim = embed_dim
-        self.physnet_hidden = physnet_hidden
+        self.seq_len = seq_len #nb of tokens
+        self.embed_dim = embed_dim #dimension of the space the token is projected
+        self.physnet_hidden = physnet_hidden #nb of neuron per layer in physnet
         
         # --- Embedding Stage ---
         # Embed each spatiotemporal point (e.g., [x, y, z, t]) into a higher-dimensional space.
         self.input_embed = nn.Linear(input_dim, embed_dim)
         
         # Positional encoding (fixed, sinusoidal)
+        #stored as non trainable parameters, buffer in pytorch = persistant tensor 
+        # buffer use to store running statistics (so not immutable)
+        #creation of self.pos_encoding
         self.register_buffer("pos_encoding", self._generate_pos_encoding(seq_len, embed_dim))
         
         # Learnable token to aggregate information
@@ -78,7 +77,7 @@ class HyperNet(nn.Module):
         # feed‑forward, normalization, and residual connections).
         encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim,
                                                    nhead=num_heads,
-                                                   dim_feedforward=embed_dim * 4,
+                                                   dim_feedforward=embed_dim * 4, #4 different than input dim
                                                    dropout=0.1,
                                                    activation='gelu')
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
@@ -116,13 +115,27 @@ class HyperNet(nn.Module):
         """
         Generates a sinusoidal positional encoding.
         Returns a tensor of shape (1, seq_len, d_model).
+        (d_model = embeded dim)
+        each token define a position , and this position is split for different
+        frequencies along the embeding dimension (will associate a diff freq to each dim)
         """
+        #start with tensor of 0 size 1000x128
         pe = torch.zeros(seq_len, d_model)
+        #create 2 d tensor colomn (each is numerator)
+        #unsqueeze to allow element wise multiplication from (seq_len,) to seq_len,1)
         position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * (-math.log(10000.0) / d_model))
+        #denominator to avoid too big number and stabilize freq (exp decay
+        #smoothly to decrease the freq as d_model increase) (spread out fred)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float) \
+                * (-math.log(10000.0) / d_model)
+        )
+        #even indexes go sin
         pe[:, 0::2] = torch.sin(position * div_term)
+        #odd indexes go cos
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # (1, seq_len, d_model)
+        #unsqueeze to make it broadcastable
+        pe = pe.unsqueeze(0)  #  from (seq_len, d_model) to (1, seq_len, d_model)
         return pe
 
     def forward(self, x):#x is context
@@ -133,12 +146,14 @@ class HyperNet(nn.Module):
         B, L, _ = x.size()
         # Embed the input points
         x_emb = self.input_embed(x)  # (B, L, embed_dim)
-        # Add fixed positional encoding (assumes L == self.seq_len)
-        x_emb = x_emb + self.pos_encoding[:, :L, :]
-        # Prepend the learnable token to aggregate context
+        # Add fixed positional encoding (assumes L == self.seq_len and that
+        #pos_encoding is broadcastable (1->B)
+        x_emb = x_emb + self.pos_encoding
+        # Prepend the learnable token to aggregate context (just expand to B)
         cls_tokens = self.cls_tokens.expand(B, -1, -1)  # (B, num_tokens, embed_dim)
+        # add the tokens alogn the 1st dimension (sq_length)
         x_emb = torch.cat((cls_tokens, x_emb), dim=1)  # now the sequence length becomes (num_tokens + L)
-                
+
         # Transformer encoder expects shape (S, B, D)
         x_emb = x_emb.transpose(0, 1)  # (num_tokens+L, B, embed_dim)
         transformer_out = self.transformer(x_emb)  # (num_tokens+L, B, embed_dim)
@@ -154,6 +169,7 @@ class HyperNet(nn.Module):
         # Layer 1
         l1_weight = self.gen_l1_weight(summary)  # (B, physnet_hidden * 1)
         l1_bias   = self.gen_l1_bias(summary)      # (B, physnet_hidden)
+        # .view is like reshape
         params['l1_weight'] = l1_weight.view(B, self.physnet_hidden, 1)
         params['l1_bias']   = l1_bias.view(B, self.physnet_hidden)
         
@@ -258,9 +274,10 @@ class Coach:
 
     def evaluate(self, loader):
         """Evaluate the model on a given data loader and return the average loss."""
+        #switch from train to evaluate
         self.model.eval()
         total_loss = 0.0
-        with torch.no_grad():
+        with torch.no_grad():#no tracking of steps for autodiff bc only eval
             for batch in loader:
                 context = batch['context'].to(self.device)           # shape: (B, seq_len, 4)
                 query_time = batch['query_time'].to(self.device)         # shape: (B, k_query, 1)
@@ -367,17 +384,3 @@ class HybridLoss(nn.Module):
         total_loss = data_loss + physics_loss
         return total_loss, data_loss, physics_loss
     
-
-#still need training and save
-##############################################
-#  Example usage (you can integrate this into your training loop)
-##############################################
-# Suppose you have:
-#   - context: a tensor of shape (B, 1000, 4) from your database (e.g. normalized [x,y,z,t])
-#   - t: a tensor of shape (B, 1) for the query time points
-#
-# model = DeepPhysiNet()
-# pred_xyz = model(context, t)
-#
-# Then, you can compute your loss with CombinedLoss and backpropagate accordingly.
-#physnetclass
