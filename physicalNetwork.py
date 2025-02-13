@@ -1,6 +1,6 @@
 
 import meteo_api as API
-
+import matplotlib.pyplot as plt # type: ignore
 import math
 import torch # type: ignore
 import torch.nn as nn # type: ignore
@@ -283,19 +283,25 @@ class Coach:
                 query_time = batch['query_time'].to(self.device)         # shape: (B, k_query, 1)
                 query_state = batch['query_state'].to(self.device)       # shape: (B, k_query, 3)
                 
-                # Ensure query_time requires gradients (needed for physics loss via autograd)
+                # redundant just for consistancy
                 query_time.requires_grad_()
                 
                 # Forward pass through the model (which internally trains the hypernetwork and physnet)
                 pred = self.model(context, query_time)
+                #return total loss data loss physical loss , ignore the last 2
                 loss, _, _ = self.loss_fn(query_time, pred, query_state)
                 total_loss += loss.item()
         avg_loss = total_loss / len(loader)
         self.model.train()
         return avg_loss
 
-    def train(self, num_epochs=100, save_path='deep_physinet.pth'):
+    def train(self, num_epochs=100, save_path= API.config.MODELS_DIR):
         """Train the model for a specified number of epochs and evaluate on test data each epoch."""
+        # Lists to record losses for plotting later
+        train_losses = []
+        test_within_losses = []
+        test_unseen_losses = []
+        
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             for batch in self.train_loader:
@@ -306,16 +312,13 @@ class Coach:
                 query_time = batch['query_time'].to(self.device)
                 query_state = batch['query_state'].to(self.device)
                 
-                # Mark query_time for gradient calculation (needed for the physics loss)
-                query_time.requires_grad_()
+                query_time.requires_grad_()  # enable gradient computation for physics loss
                 
-                # Forward pass: hypernetwork generates parameters and physnet produces the prediction.
                 pred = self.model(context, query_time)
+                total_loss, data_loss, physics_loss = self.loss_fn(
+                    query_time, pred, query_state
+                )
                 
-                # Compute total loss (data loss + physics loss)
-                total_loss, data_loss, physics_loss = self.loss_fn(query_time, pred, query_state)
-                
-                # Backpropagation and optimizer step
                 total_loss.backward()
                 self.optimizer.step()
                 
@@ -325,14 +328,51 @@ class Coach:
             test_within_loss = self.evaluate(self.test_within_loader)
             test_unseen_loss = self.evaluate(self.test_unseen_loader)
             
+            train_losses.append(avg_train_loss)
+            test_within_losses.append(test_within_loss)
+            test_unseen_losses.append(test_unseen_loss)
+            
             print(f"Epoch [{epoch+1}/{num_epochs}] | "
                   f"Train Loss: {avg_train_loss:.6f} | "
                   f"Test Within Loss: {test_within_loss:.6f} | "
                   f"Test Unseen Loss: {test_unseen_loss:.6f}")
         
         # Save the model after training
+        #path looks like ?
         torch.save(self.model.state_dict(), save_path)
         print(f"Model saved to {save_path}")
+        
+        # Plot the loss curves after training
+        self.plot_loss_curves(train_losses, test_within_losses, test_unseen_losses, 
+                              save=True, filepath=API.config.LOGS_DIR)
+
+    def plot_loss_curves(
+            self, train_losses, test_within_losses,
+              test_unseen_losses, save=False, filepath=API.config.LOGS_DIR):
+        """
+        Plots the training loss, test within loss, and test unseen loss curves over epochs.
+        
+        Parameters:
+            train_losses (list): List of average training losses per epoch.
+            test_within_losses (list): List of average test (within) losses per epoch.
+            test_unseen_losses (list): List of average test (unseen) losses per epoch.
+            save (bool): If True, saves the plot to the given filepath.
+            filepath (str): The file path where the plot will be saved if save=True.
+        """
+        filepath += "fig1.png"
+        epochs = range(1, len(train_losses) + 1)
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, train_losses, 'b-', label='Train Loss')
+        plt.plot(epochs, test_within_losses, 'r-', label='Test Within Loss')
+        plt.plot(epochs, test_unseen_losses, 'g-', label='Test Unseen Loss')
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss')
+        plt.title('Training and Test Loss Curves')
+        plt.legend()
+        plt.grid(True)
+        if save:
+            plt.savefig(filepath)
+        plt.show()
 
 class HybridLoss(nn.Module):
     def __init__(self, scaler_y, sigma=10.0, rho=28.0, beta=8.0/3.0):

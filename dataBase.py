@@ -283,9 +283,10 @@ class DataBase:
         # Split trajectories within each training zone.
         for zone in train_zone_ids:
             trajs = self.zone2trajectories[zone]
-            train_trajs, test_trajs = train_test_split(trajs, 
-                                                       test_size=self.within_zone_test_fraction,
-                                                       random_state=API.config.SEED_SHUFFLE)
+            train_trajs, test_trajs = train_test_split(
+                trajs, 
+                test_size=self.within_zone_test_fraction,
+                random_state=API.config.SEED_SHUFFLE)
             train_list.extend(train_trajs)
             test_within_list.extend(test_trajs)
 
@@ -298,20 +299,38 @@ class DataBase:
         self.test_unseen_list = test_unseen_list
 
     def get_train_loader(self, shuffle=True):
-        train_dataset = TrajectoryDataset(self.train_list, 
-                                          k_query=self.k_query, 
-                                          context_fraction=self.context_fraction)
-        return DataLoader(train_dataset, batch_size=self.batch_size, shuffle=shuffle, num_workers=4)
+        train_dataset = TrajectoryDataset(
+            self.train_list, 
+            k_query=self.k_query, 
+            context_fraction=self.context_fraction,
+            max_token=self.max_token
+        )
+        return DataLoader(
+            train_dataset, batch_size=self.batch_size, 
+            shuffle=shuffle, num_workers=4
+        )
 
     def get_test_within_loader(self, shuffle=False):
-        test_within_dataset = TrajectoryDataset(self.test_within_list, 
-                                                k_query=self.k_query, 
-                                                context_fraction=self.context_fraction)
-        return DataLoader(test_within_dataset, batch_size=self.batch_size, shuffle=shuffle, num_workers=4)
+        test_within_dataset = TrajectoryDataset(
+            self.test_within_list, 
+            k_query=self.k_query, 
+            context_fraction=self.context_fraction,
+            max_token=self.max_token
+        )
+        return DataLoader(
+            test_within_dataset, batch_size=self.batch_size, 
+            shuffle=shuffle, num_workers=4
+        )
 
     def get_test_unseen_loader(self, shuffle=False):
-        test_unseen_dataset = TrajectoryDataset(self.test_unseen_list, 
-                                                k_query=self.k_query, 
-                                                context_fraction=self.context_fraction)
-        return DataLoader(test_unseen_dataset, batch_size=self.batch_size, shuffle=shuffle, num_workers=4)
+        test_unseen_dataset = TrajectoryDataset(
+            self.test_unseen_list, 
+            k_query=self.k_query, 
+            context_fraction=self.context_fraction,
+            max_token=self.max_token
+        )
+        return DataLoader(
+            test_unseen_dataset, batch_size=self.batch_size,
+            shuffle=shuffle, num_workers=4
+        )
 
