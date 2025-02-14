@@ -93,7 +93,7 @@ class HyperNet(nn.Module):
         #  * Layer 3: weight shape (physnet_hidden, physnet_hidden), bias shape (physnet_hidden)
         #  * Layer 4: weight shape (physnet_hidden, physnet_hidden), bias shape (physnet_hidden)
         #  * Output layer: weight shape (3, physnet_hidden), bias shape (3)
-        
+
         # Layer 1 heads
         self.gen_l1_weight = nn.Linear(embed_dim, physnet_hidden * 1)
         self.gen_l1_bias   = nn.Linear(embed_dim, physnet_hidden)
@@ -276,21 +276,29 @@ class Coach:
         # Initialize TensorBoard SummaryWriter.
         # We use the same API.config.LOGS_DIR used for saving plots, appending a subfolder.
         self.writer = SummaryWriter(log_dir=API.config.LOGS_DIR + '/tensorboard')
-
-    def evaluate(self, loader):
+    
+    def evaluate(self, loader, high_res_eval=False):
         """Evaluate the model on a given data loader and return the average loss."""
         self.model.eval()
         total_loss = 0.0
         with torch.no_grad():
             for batch in loader:
-                context = batch['context'].to(self.device)           # shape: (B, seq_len, 4)
-                query_time = batch['query_time'].to(self.device)         # shape: (B, k_query, 1)
-                query_state = batch['query_state'].to(self.device)       # shape: (B, k_query, 3)
-                
-                query_time.requires_grad_()
-                
-                pred = self.model(context, query_time)
-                loss, _, _ = self.loss_fn(query_time, pred, query_state)
+                context = batch['context'].to(self.device)
+                # For evaluation, if high_res_eval is True, use the full trajectory:
+                if high_res_eval:
+                    full_time = batch['full_time'].to(self.device)  # full resolution times
+                    full_state = batch['full_state'].to(self.device)  # full resolution states
+                    full_time.requires_grad_()
+                    # Generate parameters once
+                    params = self.model.hypernet(context)
+                    pred_full = self.model.physnet(full_time, params)
+                    loss, _, _ = self.loss_fn(full_time, pred_full, full_state)
+                else:
+                    query_time = batch['available_time'].to(self.device)
+                    query_state = batch['available_state'].to(self.device)
+                    query_time.requires_grad_()
+                    pred = self.model(context, query_time)
+                    loss, _, _ = self.loss_fn(query_time, pred, query_state)
                 total_loss += loss.item()
         avg_loss = total_loss / len(loader)
         self.model.train()
@@ -298,26 +306,81 @@ class Coach:
     
     #need to test on unsee resolution also 
     def train(self, num_epochs=100):
-        """Train the model for a specified number of epochs and evaluate on test data each epoch."""
-        # Lists to record losses for plotting later
-        train_losses = []
-        test_within_losses = []
-        test_unseen_losses = []
-        
+        """Train the model for a specified number of epochs.
+        For each training batch:
+        - Use the provided context (grid points for the hypernetwork).
+        - Generate a high-resolution time grid from the grid (available) times.
+        - Use the hypernetwork to generate physics network parameters (run once per batch).
+        - Query the physics network on the full high-res time grid.
+        - Extract predictions corresponding to the grid points (using torch.gather) and compute both data (MSE) and PDE losses.
+        - For the inner points (the extra high-res points), compute only the PDE loss.
+        - Sum the losses and backpropagate.
+        """
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             for batch in self.train_loader:
                 self.optimizer.zero_grad()
                 
-                # Retrieve batch data and send to device
-                context = batch['context'].to(self.device)
-                query_time = batch['query_time'].to(self.device)
-                query_state = batch['query_state'].to(self.device)
+                # Retrieve batch data and send to device.
+                context = batch['context'].to(self.device)  # For hypernetwork input.
+                grid_time = batch['available_time'].to(self.device)  # Grid (available) times. Shape: (B, num_grid, 1)
+                grid_state = batch['available_state'].to(self.device)  # Ground truth states for grid points. Shape: (B, num_grid, 3)
                 
-                query_time.requires_grad_()  # enable gradient computation for physics loss
+                # Enable gradient computation for time (needed for PDE loss).
+                grid_time.requires_grad_()
                 
-                pred = self.model(context, query_time)
-                total_loss, data_loss, physics_loss = self.loss_fn(query_time, pred, query_state)
+                B, num_grid, _ = grid_time.shape
+                total_points = int(num_grid * self.resolution)  # Total high-res points
+                
+                # Generate high-resolution time grid for each sample in the batch.
+                highres_time_list = []
+                for i in range(B):
+                    t_start = grid_time[i, 0, 0]
+                    t_end = grid_time[i, -1, 0]
+                    # Create a high-res time grid with total_points evenly spaced points.
+                    highres_time = torch.linspace(t_start, t_end, steps=total_points, device=self.device).unsqueeze(-1)
+                    highres_time_list.append(highres_time)
+                highres_time = torch.stack(highres_time_list, dim=0)  # Shape: (B, total_points, 1)
+                highres_time.requires_grad_()
+                
+                # Compute indices for the grid points within the high-res grid.
+                # We assume that the grid times correspond to evenly spaced indices in the high-res grid.
+                grid_indices = torch.linspace(0, total_points - 1, steps=num_grid).long().to(self.device)  # Shape: (num_grid,)
+                
+                # --- Run the hypernetwork once for this batch ---
+                params = self.model.hypernet(context)
+                
+                # --- Query the physics network on the full high-resolution time grid ---
+                pred_all = self.model.physnet(highres_time, params)  # Shape: (B, total_points, 3)
+                
+                # --- Extract predictions corresponding to the grid points ---
+                # Expand grid_indices to have the same batch and feature dimensions.
+                grid_indices_expanded = grid_indices.unsqueeze(0).unsqueeze(-1).expand(B, num_grid, 3)
+                pred_grid = torch.gather(pred_all, dim=1, index=grid_indices_expanded)  # Shape: (B, num_grid, 3)
+                
+                # --- Extract inner (non-grid) predictions ---
+                # Create a boolean mask for the high-res time grid: True at grid indices, False elsewhere.
+                mask = torch.zeros(total_points, dtype=torch.bool, device=self.device)
+                mask[grid_indices] = True
+                inner_pred_list = []
+                inner_time_list = []
+                for i in range(B):
+                    inner_pred = pred_all[i][~mask]  # Predictions at inner points.
+                    inner_time = highres_time[i][~mask]  # Corresponding time values.
+                    inner_pred_list.append(inner_pred)
+                    inner_time_list.append(inner_time)
+                inner_pred = torch.stack(inner_pred_list, dim=0)  # Shape: (B, total_points - num_grid, 3)
+                inner_time = torch.stack(inner_time_list, dim=0)      # Shape: (B, total_points - num_grid, 1)
+                inner_time.requires_grad_()
+                
+                # --- Compute losses ---
+                # For grid points: compute data loss (comparing pred_grid and grid_state) and PDE loss.
+                loss_grid, data_loss, pde_loss_grid = self.loss_fn(grid_time, pred_grid, grid_state, compute_data_loss=True)
+                # For inner points: compute only the PDE loss (since ground truth is not available).
+                loss_inner, _, pde_loss_inner = self.loss_fn(inner_time, inner_pred, None, compute_data_loss=False)
+                
+                # Total loss is the sum of grid loss and inner loss.
+                total_loss = loss_grid + loss_inner
                 
                 total_loss.backward()
                 self.optimizer.step()
@@ -328,38 +391,22 @@ class Coach:
             test_within_loss = self.evaluate(self.test_within_loader)
             test_unseen_loss = self.evaluate(self.test_unseen_loader)
             
-            train_losses.append(avg_train_loss)
-            test_within_losses.append(test_within_loss)
-            test_unseen_losses.append(test_unseen_loss)
-            
-            # Log the losses in TensorBoard.
+            # Log the losses to TensorBoard.
             self.writer.add_scalar('Loss/Train', avg_train_loss, epoch)
             self.writer.add_scalar('Loss/Test_Within', test_within_loss, epoch)
             self.writer.add_scalar('Loss/Test_Unseen', test_unseen_loss, epoch)
             
-            print(f"Epoch [{epoch+1}/{num_epochs}] | "
-                  f"Train Loss: {avg_train_loss:.6f} | "
-                  f"Test Within Loss: {test_within_loss:.6f} | "
-                  f"Test Unseen Loss: {test_unseen_loss:.6f}")
+            print(f"Epoch [{epoch+1}/{num_epochs}] | Train Loss: {avg_train_loss:.6f} | "
+                f"Test Within Loss: {test_within_loss:.6f} | Test Unseen Loss: {test_unseen_loss:.6f}")
         
-        # Save the model after training
-        save_path = Path(API.config.MODELS_DIR) / (self.get_name() + ".pth")
-        torch.save(self.model.state_dict(), save_path)
-        print(f"Model saved to {save_path}")
-        
-        # Plot the loss curves after training (existing functionality)
-        self.plot_loss_curves(train_losses, test_within_losses, test_unseen_losses, 
-                              save=True, filepath=API.config.LOGS_DIR)
-        
-        # Close the TensorBoard writer when done.
-        self.writer.close()
+        # (After training, you can use evaluate() to assess performance on both grid and inner points.)
 
     def get_name(self):
 
-        #contextSize_embededDim_nbLayers_nbHeadsPerLayer_nbTrainableTokens_kquery_contextFraction
+        #contextSize_embededDim_nbLayers_nbHeadsPerLayer_nbTrainableTokens_resolution_contextFraction
         name = "cS" + str(self.model.hypernet.seq_len) + "_eD" + str(self.model.hypernet.embeded_dim) + \
             "_nL" + str(self.model.hypernet.num_layers) + "_nH" + str(self.model.hypernet.num_heads) \
-            + "_nT" + str(self.model.hypernet.num_tokens) + "_kQ" + str(self.resolution) \
+            + "_nT" + str(self.model.hypernet.num_tokens) + "_rl" + str(self.resolution) \
             + "_cF" + str(self.model.dataBase.context_fraction)
         return name
 

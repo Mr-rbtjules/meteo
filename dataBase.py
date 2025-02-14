@@ -18,9 +18,8 @@ class TrajectoryDataset(Dataset):
     def __init__(
             self,
             trajectories,
-            resolution=10,
             context_fraction=0.5,
-            max_token=1e3
+            context_tokens=1000
         ):
         """
         Parameters:
@@ -31,8 +30,7 @@ class TrajectoryDataset(Dataset):
         super(TrajectoryDataset, self).__init__()
         self.trajectories = trajectories
         self.context_fraction = context_fraction
-        self.max_token = max_token
-        self.resolution = resolution
+        self.context_tokens = context_tokens
 
     def __len__(self):
         return len(self.trajectories)
@@ -58,7 +56,7 @@ class TrajectoryDataset(Dataset):
 
         # Down-sample context if needed.
         if full_context.shape[0] > self.max_token:
-            indices = torch.linspace(0, full_context.shape[0] - 1, steps=int(self.max_token)).long()
+            indices = torch.linspace(0, full_context.shape[0] - 1, steps=int(self.context_tokens)).long()
             context_sample = full_context[indices]
         else:
             context_sample = full_context
@@ -190,9 +188,9 @@ class DataBase:
       - test_unseen_dataset: trajectories from unseen zones
     """
     def __init__(self, 
-                 resolution=10, 
+                 resolution=2, 
                  context_fraction=0.5,
-                 max_token=1e3,
+                 context_tokens=1000,
                  load_size=1
         ):
         self.load_size = load_size
@@ -202,7 +200,7 @@ class DataBase:
         self.train_zone_fraction = 1 - API.config.TEST_DATA_PROPORTION
         self.within_zone_test_fraction = API.config.TEST_DATA_PROPORTION
         self.batch_size = API.config.BATCH_SIZE
-        self.max_token = max_token
+        self.context_tokens = context_tokens
 
         # Load trajectories (grouped by zone)
         self.zone2trajectories = self._load_trajectories()
@@ -307,7 +305,7 @@ class DataBase:
             self.train_list, 
             resolution=self.resolution, 
             context_fraction=self.context_fraction,
-            max_token=self.max_token
+            context_tokens=self.context_tokens
         )
         return DataLoader(
             train_dataset, batch_size=self.batch_size, 
@@ -319,7 +317,7 @@ class DataBase:
             self.test_within_list, 
             resolution=self.resolution, 
             context_fraction=self.context_fraction,
-            max_token=self.max_token
+            context_tokens=self.context_tokens
         )
         return DataLoader(
             test_within_dataset, batch_size=self.batch_size, 
@@ -331,7 +329,7 @@ class DataBase:
             self.test_unseen_list, 
             resolution=self.resolution, 
             context_fraction=self.context_fraction,
-            max_token=self.max_token
+            context_tokens=self.context_tokens
         )
         return DataLoader(
             test_unseen_dataset, batch_size=self.batch_size,
