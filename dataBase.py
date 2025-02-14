@@ -18,7 +18,7 @@ class TrajectoryDataset(Dataset):
     def __init__(
             self,
             trajectories,
-            k_query=1,
+            resolution=10,
             context_fraction=0.5,
             max_token=1e3
         ):
@@ -30,54 +30,55 @@ class TrajectoryDataset(Dataset):
         """
         super(TrajectoryDataset, self).__init__()
         self.trajectories = trajectories
-        self.k_query = k_query
         self.context_fraction = context_fraction
         self.max_token = max_token
+        self.resolution = resolution
 
     def __len__(self):
         return len(self.trajectories)
 
-def __getitem__(self, idx):
-    traj_sample = self.trajectories[idx]
-    time_arr = traj_sample['time']    # shape: (traj_steps, 1)
-    state_arr = traj_sample['state']   # shape: (traj_steps, 3)
-    traj_steps = time_arr.shape[0]
+    def __getitem__(self, idx):
+        traj_sample = self.trajectories[idx]
+        time_arr = traj_sample['time']    # full trajectory time, shape: (traj_steps, 1)
+        state_arr = traj_sample['state']   # full trajectory state, shape: (traj_steps, 3)
+        traj_steps = time_arr.shape[0]
 
-    # Determine the context length as a fraction of the total trajectory length.
-    context_len = int(self.context_fraction * traj_steps)
-    if context_len >= traj_steps - 1:
-        context_len = traj_steps - 2  # ensure at least one query point
+        # Determine context length (for hypernetwork)
+        context_len = int(self.context_fraction * traj_steps)
+        if context_len >= traj_steps - 1:
+            context_len = traj_steps - 2
 
-    # Obtain the context portion.
-    # Here we form a full context tensor by concatenating state and time.
-    # If you prefer [x, y, z, t] ordering, we concatenate state first, then time.
-    context_time = time_arr[:context_len]   # (context_len, 1)
-    context_state = state_arr[:context_len]   # (context_len, 3)
-    full_context = torch.cat([
-        torch.tensor(context_state, dtype=torch.float32), 
-        torch.tensor(context_time, dtype=torch.float32)
-    ], dim=-1)  # Resulting shape: (context_len, 4)
+        # Obtain context portion.
+        context_time = time_arr[:context_len]
+        context_state = state_arr[:context_len]
+        full_context = torch.cat([
+            torch.tensor(context_state, dtype=torch.float32), 
+            torch.tensor(context_time, dtype=torch.float32)
+        ], dim=-1)
 
-    # If the number of context points is greater than max_token (e.g. 1000), sample evenly spaced indices.
-    if full_context.shape[0] > self.max_token:
-        indices = torch.linspace(0, full_context.shape[0] - 1, steps=int(self.max_token)).long()
-        context_sample = full_context[indices]  # Now shape: (max_token, 4)
-    else:
-        context_sample = full_context  # Use all available points if fewer than max_token
+        # Down-sample context if needed.
+        if full_context.shape[0] > self.max_token:
+            indices = torch.linspace(0, full_context.shape[0] - 1, steps=int(self.max_token)).long()
+            context_sample = full_context[indices]
+        else:
+            context_sample = full_context
 
-    # Sample k_query query points from the remainder of the trajectory.
-    available = traj_steps - context_len
-    k = min(self.k_query, available)
-    query_indices = random.sample(range(context_len, traj_steps), k)
-    query_time = torch.tensor(time_arr[query_indices], dtype=torch.float32)   # shape: (k, 1)
-    query_state = torch.tensor(state_arr[query_indices], dtype=torch.float32)   # shape: (k, 3)
+        # For available (grid) points, we use a down-sampled version.
+        available_time = torch.tensor(time_arr[context_len:], dtype=torch.float32)
+        available_state = torch.tensor(state_arr[context_len:], dtype=torch.float32)
 
-    return {
-        'context': context_sample,     # shape: (max_token, 4) if full_context is long, otherwise (context_len, 4)
-        'query_time': query_time,        # shape: (k, 1)
-        'query_state': query_state,      # shape: (k, 3)
-        'zone': traj_sample['zone']
-    }
+        # Also return the full ground truth (if available) for evaluation.
+        full_time = torch.tensor(time_arr, dtype=torch.float32)
+        full_state = torch.tensor(state_arr, dtype=torch.float32)
+
+        return {
+            'context': context_sample,           # used by hypernetwork
+            'available_time': available_time,      # grid points for training loss
+            'available_state': available_state,    # grid ground truth for training
+            'full_time': full_time,                # full resolution ground truth time
+            'full_state': full_state,              # full resolution ground truth state
+            'zone': traj_sample['zone']
+        }
 
     @classmethod
     def createDbFromScratch(cls, output_dir, zones=100) -> None:
@@ -189,14 +190,14 @@ class DataBase:
       - test_unseen_dataset: trajectories from unseen zones
     """
     def __init__(self, 
-                 k_query=1, 
+                 resolution=10, 
                  context_fraction=0.5,
                  max_token=1e3,
-                 load_size=0.1
+                 load_size=1
         ):
         self.load_size = load_size
         self.origin_path = Path(API.config.RAW_DATA_DIR) / "trajectories_dataset/"
-        self.k_query = k_query
+        self.resolution = resolution
         self.context_fraction = context_fraction
         self.train_zone_fraction = 1 - API.config.TEST_DATA_PROPORTION
         self.within_zone_test_fraction = API.config.TEST_DATA_PROPORTION
@@ -205,10 +206,12 @@ class DataBase:
 
         # Load trajectories (grouped by zone)
         self.zone2trajectories = self._load_trajectories()
-        
-        # Flatten list of trajectories (used for normalization)
+        #is a dict key = zone id, content = list of dict key = zone , state
+        #comme ça mm qd shuffle on sait origine des zones
+        #will point the same place as zone2traj
         self.all_trajectories = []
         for zone, traj_list in self.zone2trajectories.items():
+            #traj_list is a dict with 
             self.all_trajectories.extend(traj_list)
         # Normalize globally
         self._normalize_trajectories()
@@ -236,7 +239,7 @@ class DataBase:
                 for sim in range(zone_trajs.shape[0]):
                     traj = zone_trajs[sim].T  # (traj_steps, 3)
                     traj_list.append({
-                        'zone': zone_id,
+                        'zone': zone_id, #redondant 
                         'time': time_points.copy(),
                         'state': traj
                     })
@@ -247,6 +250,7 @@ class DataBase:
     def _normalize_trajectories(self):
         """
         Normalize all trajectories globally using StandardScaler.
+        globally bc reference at same place
         """
         all_time = np.concatenate([traj['time'] for traj in self.all_trajectories], axis=0)
         all_state = np.concatenate([traj['state'] for traj in self.all_trajectories], axis=0)
@@ -286,7 +290,7 @@ class DataBase:
             train_trajs, test_trajs = train_test_split(
                 trajs, 
                 test_size=self.within_zone_test_fraction,
-                random_state=API.config.SEED_SHUFFLE)
+                random_state=API.config.SEED_SHUFFLE) #shuffle for split not zones
             train_list.extend(train_trajs)
             test_within_list.extend(test_trajs)
 
@@ -301,7 +305,7 @@ class DataBase:
     def get_train_loader(self, shuffle=True):
         train_dataset = TrajectoryDataset(
             self.train_list, 
-            k_query=self.k_query, 
+            resolution=self.resolution, 
             context_fraction=self.context_fraction,
             max_token=self.max_token
         )
@@ -313,7 +317,7 @@ class DataBase:
     def get_test_within_loader(self, shuffle=False):
         test_within_dataset = TrajectoryDataset(
             self.test_within_list, 
-            k_query=self.k_query, 
+            resolution=self.resolution, 
             context_fraction=self.context_fraction,
             max_token=self.max_token
         )
@@ -325,7 +329,7 @@ class DataBase:
     def get_test_unseen_loader(self, shuffle=False):
         test_unseen_dataset = TrajectoryDataset(
             self.test_unseen_list, 
-            k_query=self.k_query, 
+            resolution=self.resolution, 
             context_fraction=self.context_fraction,
             max_token=self.max_token
         )

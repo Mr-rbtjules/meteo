@@ -6,11 +6,15 @@ import torch # type: ignore
 import torch.nn as nn # type: ignore
 import torch.optim as optim # type: ignore
 import torch.nn.functional as F # type: ignore
-
+from torch.utils.tensorboard import SummaryWriter # type: ignore
+from pathlib import Path
 
 class HybridNet(nn.Module):
-    def __init__(self, seq_len=1000, input_dim=4, embed_dim=128,
-                 num_layers=2, num_heads=4, physnet_hidden=64, num_tokens=1):
+    def __init__(
+            self, seq_len=1000, input_dim=4, 
+            embed_dim=128, num_layers=2, num_heads=4, 
+            physnet_hidden=64, num_tokens=1
+        ):
         super(HybridNet, self).__init__()
         #create a Hypernetwork (transformers)
         self.hypernet = HyperNet(seq_len=seq_len,
@@ -29,7 +33,6 @@ class HybridNet(nn.Module):
         # Compute the prediction at time t using the dynamic physics network
         pred = self.physnet(t, params)
         return pred
-
 
 
 class HyperNet(nn.Module):
@@ -54,7 +57,7 @@ class HyperNet(nn.Module):
             num_heads=4, physnet_hidden=64, num_tokens=1
         ):
         super(HyperNet, self).__init__()
-        self.seq_len = seq_len #nb of tokens
+        self.seq_len = seq_len #nb of tokens, context
         self.embed_dim = embed_dim #dimension of the space the token is projected
         self.physnet_hidden = physnet_hidden #nb of neuron per layer in physnet
         
@@ -244,58 +247,57 @@ class PhysNet(nn.Module):
         out = API.tools.batched_linear(x, params['out_weight'], params['out_bias'])
         return out
     
-
 class Coach:
     """
     Trainer class for joint training of the hypernetwork (which generates the physics network parameters)
     and the physics network itself, with evaluation on test data to monitor overfitting.
     """
-    def __init__(
-            self, model, train_loader, test_within_loader,
-            test_unseen_loader, loss_fn, optimizer, device
-        ):
+    def __init__( self, model, dataBase, device, resolution=10, lr=1e-3):
         """
         Parameters:
           - model: An instance of DeepPhysiNet.
           - train_loader: DataLoader for the training set.
-          - test_within_loader: DataLoader for trajectories from training zones (reserved for testing initial condition sensitivity).
+          - test_within_loader: DataLoader for trajectories from training zones.
           - test_unseen_loader: DataLoader for trajectories from unseen zones.
           - loss_fn: HybridLoss (combines data and physics loss).
           - optimizer: Optimizer (e.g., Adam) updating model parameters.
           - device: Torch device ('cuda' or 'cpu').
         """
         self.model = model
-        self.train_loader = train_loader
-        self.test_within_loader = test_within_loader
-        self.test_unseen_loader = test_unseen_loader
-        self.loss_fn = loss_fn
-        self.optimizer = optimizer
+        self.loss_fn = API.HybridLoss(scaler_y=None)
+        self.optimizer = optim.Adam(model.parameters(), lr=lr)
         self.device = device
+        self.dataBase = dataBase
+        self.resolution = resolution
+        self.train_loader = self.dataBase.get_train_loader(shuffle=True)
+        self.test_within_loader = self.dataBase.get_test_within_loader(shuffle=False)
+        self.test_unseen_loader = self.dataBase.get_test_unseen_loader(shuffle=False)
+
+        # Initialize TensorBoard SummaryWriter.
+        # We use the same API.config.LOGS_DIR used for saving plots, appending a subfolder.
+        self.writer = SummaryWriter(log_dir=API.config.LOGS_DIR + '/tensorboard')
 
     def evaluate(self, loader):
         """Evaluate the model on a given data loader and return the average loss."""
-        #switch from train to evaluate
         self.model.eval()
         total_loss = 0.0
-        with torch.no_grad():#no tracking of steps for autodiff bc only eval
+        with torch.no_grad():
             for batch in loader:
                 context = batch['context'].to(self.device)           # shape: (B, seq_len, 4)
                 query_time = batch['query_time'].to(self.device)         # shape: (B, k_query, 1)
                 query_state = batch['query_state'].to(self.device)       # shape: (B, k_query, 3)
                 
-                # redundant just for consistancy
                 query_time.requires_grad_()
                 
-                # Forward pass through the model (which internally trains the hypernetwork and physnet)
                 pred = self.model(context, query_time)
-                #return total loss data loss physical loss , ignore the last 2
                 loss, _, _ = self.loss_fn(query_time, pred, query_state)
                 total_loss += loss.item()
         avg_loss = total_loss / len(loader)
         self.model.train()
         return avg_loss
-
-    def train(self, num_epochs=100, save_path= API.config.MODELS_DIR):
+    
+    #need to test on unsee resolution also 
+    def train(self, num_epochs=100):
         """Train the model for a specified number of epochs and evaluate on test data each epoch."""
         # Lists to record losses for plotting later
         train_losses = []
@@ -315,9 +317,7 @@ class Coach:
                 query_time.requires_grad_()  # enable gradient computation for physics loss
                 
                 pred = self.model(context, query_time)
-                total_loss, data_loss, physics_loss = self.loss_fn(
-                    query_time, pred, query_state
-                )
+                total_loss, data_loss, physics_loss = self.loss_fn(query_time, pred, query_state)
                 
                 total_loss.backward()
                 self.optimizer.step()
@@ -332,34 +332,44 @@ class Coach:
             test_within_losses.append(test_within_loss)
             test_unseen_losses.append(test_unseen_loss)
             
+            # Log the losses in TensorBoard.
+            self.writer.add_scalar('Loss/Train', avg_train_loss, epoch)
+            self.writer.add_scalar('Loss/Test_Within', test_within_loss, epoch)
+            self.writer.add_scalar('Loss/Test_Unseen', test_unseen_loss, epoch)
+            
             print(f"Epoch [{epoch+1}/{num_epochs}] | "
                   f"Train Loss: {avg_train_loss:.6f} | "
                   f"Test Within Loss: {test_within_loss:.6f} | "
                   f"Test Unseen Loss: {test_unseen_loss:.6f}")
         
         # Save the model after training
-        #path looks like ?
+        save_path = Path(API.config.MODELS_DIR) / (self.get_name() + ".pth")
         torch.save(self.model.state_dict(), save_path)
         print(f"Model saved to {save_path}")
         
-        # Plot the loss curves after training
+        # Plot the loss curves after training (existing functionality)
         self.plot_loss_curves(train_losses, test_within_losses, test_unseen_losses, 
                               save=True, filepath=API.config.LOGS_DIR)
+        
+        # Close the TensorBoard writer when done.
+        self.writer.close()
+
+    def get_name(self):
+
+        #contextSize_embededDim_nbLayers_nbHeadsPerLayer_nbTrainableTokens_kquery_contextFraction
+        name = "cS" + str(self.model.hypernet.seq_len) + "_eD" + str(self.model.hypernet.embeded_dim) + \
+            "_nL" + str(self.model.hypernet.num_layers) + "_nH" + str(self.model.hypernet.num_heads) \
+            + "_nT" + str(self.model.hypernet.num_tokens) + "_kQ" + str(self.resolution) \
+            + "_cF" + str(self.model.dataBase.context_fraction)
+        return name
 
     def plot_loss_curves(
             self, train_losses, test_within_losses,
-              test_unseen_losses, save=False, filepath=API.config.LOGS_DIR):
+              test_unseen_losses, save=False, filepath=API.config.FIG_DIR):
         """
         Plots the training loss, test within loss, and test unseen loss curves over epochs.
-        
-        Parameters:
-            train_losses (list): List of average training losses per epoch.
-            test_within_losses (list): List of average test (within) losses per epoch.
-            test_unseen_losses (list): List of average test (unseen) losses per epoch.
-            save (bool): If True, saves the plot to the given filepath.
-            filepath (str): The file path where the plot will be saved if save=True.
         """
-        filepath += "fig1.png"
+        filepath = Path(filepath) / (self.get_name() + ".png")
         epochs = range(1, len(train_losses) + 1)
         plt.figure(figsize=(10, 6))
         plt.plot(epochs, train_losses, 'b-', label='Train Loss')
@@ -383,44 +393,46 @@ class HybridLoss(nn.Module):
         self.rho = rho
         self.beta = beta
     
-    def forward(self, t, space_pred, space_true):
-        #y = space coord x,y,z
-        # Data Loss
-        data_loss = self.mse_loss(space_pred, space_true)
-        
+
+    #so use forward twice ?
+    def forward(self, t, space_pred, space_true=None, compute_data_loss=True):
+        # Compute data loss only if requested and if ground truth is provided.
+        if compute_data_loss and space_true is not None:
+            data_loss = self.mse_loss(space_pred, space_true)
+        else:
+            data_loss = 0.0
+
         # Compute derivatives using autograd
         space_pred = space_pred.requires_grad_(True)
         dydt = torch.autograd.grad(
             outputs=space_pred,
             inputs=t,
-            grad_outputs=torch.ones_like(space_pred), #seed for autodiff
+            grad_outputs=torch.ones_like(space_pred),
             create_graph=True,
             retain_graph=True,
             only_inputs=True
         )[0]  # Shape: (batch_size, 3)
-        
+
         # Extract individual components
         x_pred = space_pred[:, 0]
         y_pred = space_pred[:, 1]
         z_pred = space_pred[:, 2]
-        
+
         dxdt_pred = dydt[:, 0]
         dydt_pred = dydt[:, 1]
         dzdt_pred = dydt[:, 2]
-        
+
         # Define Lorenz ODEs
         dxdt_lorenz = self.sigma * (y_pred - x_pred)
         dydt_lorenz = x_pred * (self.rho - z_pred) - y_pred
         dzdt_lorenz = x_pred * y_pred - self.beta * z_pred
-        
-        # Physics Loss
+
+        # Physics loss
         physics_loss_x = self.mse_loss(dxdt_pred, dxdt_lorenz)
         physics_loss_y = self.mse_loss(dydt_pred, dydt_lorenz)
         physics_loss_z = self.mse_loss(dzdt_pred, dzdt_lorenz)
-        
         physics_loss = physics_loss_x + physics_loss_y + physics_loss_z
-        
-        # Total Loss
+
         total_loss = data_loss + physics_loss
+        #maybe we need to scale data loss for grid points since less numerous
         return total_loss, data_loss, physics_loss
-    
