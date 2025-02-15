@@ -69,7 +69,8 @@ class HyperNet(nn.Module):
         #stored as non trainable parameters, buffer in pytorch = persistant tensor 
         # buffer use to store running statistics (so not immutable)
         #creation of self.pos_encoding
-        self.register_buffer("pos_encoding", self._generate_pos_encoding(seq_len, embed_dim))
+        #so the only thing i need to do to have unifexed nb of input is to put this in forward ?
+        self.register_buffer("pos_encoding", self._generate_pos_encoding(self.seq_len, self.embed_dim))
         
         # Learnable token to aggregate information
         self.num_tokens = num_tokens  # define the number of tokens as a hyperparameter
@@ -332,15 +333,18 @@ class Coach:
                 B, num_grid, _ = grid_time.shape
                 total_points = int(num_grid * self.resolution)  # Total high-res points
                 
-                # Generate high-resolution time grid for each sample in the batch.
-                highres_time_list = []
-                for i in range(B):
-                    t_start = grid_time[i, 0, 0]
-                    t_end = grid_time[i, -1, 0]
-                    # Create a high-res time grid with total_points evenly spaced points.
-                    highres_time = torch.linspace(t_start, t_end, steps=total_points, device=self.device).unsqueeze(-1)
-                    highres_time_list.append(highres_time)
-                highres_time = torch.stack(highres_time_list, dim=0)  # Shape: (B, total_points, 1)
+                # Extract start and end times for each sample (shape: (B,))
+                t_start = grid_time[:, 0, 0]  # shape: (B,)
+                t_end   = grid_time[:, -1, 0]  # shape: (B,)
+
+                # Create a 1D vector of evenly spaced values from 0 to 1 (shape: (total_points,))
+                scaled = torch.linspace(0, 1, steps=total_points, device=self.device)  # shape: (total_points,)
+
+                # Compute high-resolution times using broadcasting:
+                # For each sample i, highres_time[i] = t_start[i] + (t_end[i] - t_start[i]) * scaled
+                highres_time = t_start.unsqueeze(1) + (t_end - t_start).unsqueeze(1) * scaled.unsqueeze(0)
+                # Add an extra dimension so that highres_time becomes (B, total_points, 1)
+                highres_time = highres_time.unsqueeze(-1)
                 highres_time.requires_grad_()
                 
                 # Compute indices for the grid points within the high-res grid.
@@ -404,10 +408,10 @@ class Coach:
     def get_name(self):
 
         #contextSize_embededDim_nbLayers_nbHeadsPerLayer_nbTrainableTokens_resolution_contextFraction
-        name = "cS" + str(self.model.hypernet.seq_len) + "_eD" + str(self.model.hypernet.embeded_dim) + \
+        name = "cS" + str(self.model.hypernet.seq_len) + "_eD" + str(self.model.hypernet.embed_dim) + \
             "_nL" + str(self.model.hypernet.num_layers) + "_nH" + str(self.model.hypernet.num_heads) \
             + "_nT" + str(self.model.hypernet.num_tokens) + "_rl" + str(self.resolution) \
-            + "_cF" + str(self.model.dataBase.context_fraction)
+            + "_cF" + str(self.dataBase.context_fraction)
         return name
 
     def plot_loss_curves(

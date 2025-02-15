@@ -55,7 +55,7 @@ class TrajectoryDataset(Dataset):
         ], dim=-1)
 
         # Down-sample context if needed.
-        if full_context.shape[0] > self.max_token:
+        if full_context.shape[0] > self.context_tokens:
             indices = torch.linspace(0, full_context.shape[0] - 1, steps=int(self.context_tokens)).long()
             context_sample = full_context[indices]
         else:
@@ -188,14 +188,12 @@ class DataBase:
       - test_unseen_dataset: trajectories from unseen zones
     """
     def __init__(self, 
-                 resolution=2, 
                  context_fraction=0.5,
                  context_tokens=1000,
                  load_size=1
         ):
         self.load_size = load_size
         self.origin_path = Path(API.config.RAW_DATA_DIR) / "trajectories_dataset/"
-        self.resolution = resolution
         self.context_fraction = context_fraction
         self.train_zone_fraction = 1 - API.config.TEST_DATA_PROPORTION
         self.within_zone_test_fraction = API.config.TEST_DATA_PROPORTION
@@ -303,7 +301,6 @@ class DataBase:
     def get_train_loader(self, shuffle=True):
         train_dataset = TrajectoryDataset(
             self.train_list, 
-            resolution=self.resolution, 
             context_fraction=self.context_fraction,
             context_tokens=self.context_tokens
         )
@@ -315,7 +312,6 @@ class DataBase:
     def get_test_within_loader(self, shuffle=False):
         test_within_dataset = TrajectoryDataset(
             self.test_within_list, 
-            resolution=self.resolution, 
             context_fraction=self.context_fraction,
             context_tokens=self.context_tokens
         )
@@ -327,7 +323,6 @@ class DataBase:
     def get_test_unseen_loader(self, shuffle=False):
         test_unseen_dataset = TrajectoryDataset(
             self.test_unseen_list, 
-            resolution=self.resolution, 
             context_fraction=self.context_fraction,
             context_tokens=self.context_tokens
         )

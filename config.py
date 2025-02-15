@@ -16,7 +16,7 @@ SEED_NP = 4
 SEED_RAND = 5
 SEED_SHUFFLE = 6
 TEST_DATA_PROPORTION = 0.2
-BATCH_SIZE = 1024
+BATCH_SIZE = 8
 
 """
 #seed for data shuffle
