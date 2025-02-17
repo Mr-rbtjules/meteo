@@ -11,70 +11,87 @@ import torch  # type: ignore
 from torch.utils.data import Dataset, DataLoader  # type: ignore
 import random
 
+
+
 class TrajectoryDataset(Dataset):
     """
-    A Dataset that splits each trajectory into a context portion and k query points.
+    A Dataset that, for each trajectory, uses only the first half of the data
+    and splits it into three parts:
+      - context: a fixed number of points (e.g. 1000) sampled from the high-res version of the first half.
+      - grid: from the high-res version of the first half, a fixed number of points (e.g. 1000) evenly spaced.
+      - inner: the remaining points from the high-res version (used for PDE loss only).
     """
     def __init__(
             self,
             trajectories,
-            context_fraction=0.5,
-            context_tokens=1000
+            context_fraction=0.5,     # Use only the first half of the trajectory.
+            context_tokens=1000,      # Fixed number of points for context (and grid).
+            resolution_factor=2       # Total high-res points = resolution_factor * context_tokens.
         ):
-        """
-        Parameters:
-          - trajectories: a list of trajectory dictionaries (each with 'zone', 'time', 'state')
-          - k_query: number of query points to sample from the latter part of the trajectory
-          - context_fraction: fraction of the trajectory to use as the context
-        """
         super(TrajectoryDataset, self).__init__()
         self.trajectories = trajectories
         self.context_fraction = context_fraction
         self.context_tokens = context_tokens
+        self.resolution_factor = resolution_factor
 
     def __len__(self):
         return len(self.trajectories)
 
     def __getitem__(self, idx):
         traj_sample = self.trajectories[idx]
-        time_arr = traj_sample['time']    # full trajectory time, shape: (traj_steps, 1)
-        state_arr = traj_sample['state']   # full trajectory state, shape: (traj_steps, 3)
+        time_arr = traj_sample['time']    # shape: (traj_steps, 1)
+        state_arr = traj_sample['state']   # shape: (traj_steps, 3)
         traj_steps = time_arr.shape[0]
 
-        # Determine context length (for hypernetwork)
-        context_len = int(self.context_fraction * traj_steps)
-        if context_len >= traj_steps - 1:
-            context_len = traj_steps - 2
+        # Use only the first half of the trajectory.
+        half_steps = int(traj_steps * self.context_fraction)
+        if half_steps < self.context_tokens:
+            raise ValueError("Not enough points in the first half for the desired context_tokens.")
 
-        # Obtain context portion.
-        context_time = time_arr[:context_len]
-        context_state = state_arr[:context_len]
-        full_context = torch.cat([
-            torch.tensor(context_state, dtype=torch.float32), 
+        # Define the half portion.
+        time_half = time_arr[:half_steps]    # (half_steps, 1)
+        state_half = state_arr[:half_steps]   # (half_steps, 3)
+
+        # --- High-Resolution Sampling ---
+        # Total high-res points = resolution_factor * context_tokens
+        high_res_length = self.resolution_factor * self.context_tokens
+        # Evenly sample indices from 0 to half_steps-1.
+        indices_highres = np.linspace(0, half_steps - 1, num=high_res_length, dtype=int)
+        highres_time = time_half[indices_highres]    # (high_res_length, 1)
+        highres_state = state_half[indices_highres]   # (high_res_length, 3)
+
+        # Save the full high-res sample (already in order).
+        full_time = torch.tensor(highres_time, dtype=torch.float32)   # (high_res_length, 1)
+        full_state = torch.tensor(highres_state, dtype=torch.float32) # (high_res_length, 3)
+
+        # --- Context (for the hypernetwork) ---
+        # For simplicity, pick grid points by taking one every resolution_factor from the high-res sample.
+        indices_context = np.arange(0, high_res_length, self.resolution_factor)  # shape: (context_tokens,)
+        context_time = highres_time[indices_context]    # (context_tokens, 1)
+        context_state = highres_state[indices_context]  # (context_tokens, 3)
+        context = torch.cat([
+            torch.tensor(context_state, dtype=torch.float32),
             torch.tensor(context_time, dtype=torch.float32)
-        ], dim=-1)
+        ], dim=-1)  # (context_tokens, 4)
 
-        # Down-sample context if needed.
-        if full_context.shape[0] > self.context_tokens:
-            indices = torch.linspace(0, full_context.shape[0] - 1, steps=int(self.context_tokens)).long()
-            context_sample = full_context[indices]
-        else:
-            context_sample = full_context
-
-        # For available (grid) points, we use a down-sampled version.
-        available_time = torch.tensor(time_arr[context_len:], dtype=torch.float32)
-        available_state = torch.tensor(state_arr[context_len:], dtype=torch.float32)
-
-        # Also return the full ground truth (if available) for evaluation.
-        full_time = torch.tensor(time_arr, dtype=torch.float32)
-        full_state = torch.tensor(state_arr, dtype=torch.float32)
+        # --- Grid and Inner Splits ---
+        # Grid points: same as context selection.
+        grid_time = torch.tensor(highres_time[indices_context], dtype=torch.float32)   # (context_tokens, 1)
+        grid_state = torch.tensor(highres_state[indices_context], dtype=torch.float32) # (context_tokens, 3)
+        # Inner points: the remaining indices from the high-res sample.
+        all_indices = np.arange(high_res_length)
+        indices_inner = np.setdiff1d(all_indices, indices_context)
+        inner_time = torch.tensor(highres_time[indices_inner], dtype=torch.float32)    # (high_res_length - context_tokens, 1)
+        inner_state = torch.tensor(highres_state[indices_inner], dtype=torch.float32)  # (high_res_length - context_tokens, 3)
 
         return {
-            'context': context_sample,           # used by hypernetwork
-            'available_time': available_time,      # grid points for training loss
-            'available_state': available_state,    # grid ground truth for training
-            'full_time': full_time,                # full resolution ground truth time
-            'full_state': full_state,              # full resolution ground truth state
+            'context': context,           # (context_tokens, 4)
+            'grid_time': grid_time,       # (context_tokens, 1)
+            'grid_state': grid_state,     # (context_tokens, 3)
+            'inner_time': inner_time,     # (high_res_length - context_tokens, 1)
+            'inner_state': inner_state,   # (high_res_length - context_tokens, 3)
+            'full_time': full_time,       # (high_res_length, 1)
+            'full_state': full_state,     # (high_res_length, 3)
             'zone': traj_sample['zone']
         }
 
@@ -240,7 +257,7 @@ class DataBase:
                         'state': traj
                     })
                 zone2traj[zone_id] = traj_list
-        print("data Loaded")
+        print("Data loaded")
         return zone2traj
 
     def _normalize_trajectories(self):
@@ -262,6 +279,7 @@ class DataBase:
             traj['time'] = all_time_norm[start_idx:start_idx + n_points]
             traj['state'] = all_state_norm[start_idx:start_idx + n_points]
             start_idx += n_points
+        print("Data normalized")
 
     def _split_dataset(self):
         """
@@ -297,6 +315,7 @@ class DataBase:
         self.train_list = train_list
         self.test_within_list = test_within_list
         self.test_unseen_list = test_unseen_list
+        print("Data splitted")
 
     def get_train_loader(self, shuffle=True):
         train_dataset = TrajectoryDataset(

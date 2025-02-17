@@ -26,6 +26,7 @@ class HybridNet(nn.Module):
                                  num_tokens=num_tokens)  # pass num_tokens if you decide to use more
         #create a Physical Network (simple perceptron layers)
         self.physnet = PhysNet(physnet_hidden=physnet_hidden)
+        print("HybridNet initialized")
     
     def forward(self, context, t):
         # Generate physics network parameters from context using the hypernetwork
@@ -81,6 +82,7 @@ class HyperNet(nn.Module):
         # feed‑forward, normalization, and residual connections).
         encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim,
                                                    nhead=num_heads,
+                                                   batch_first=True,
                                                    dim_feedforward=embed_dim * 4, #4 different than input dim
                                                    dropout=0.1,
                                                    activation='gelu')
@@ -253,7 +255,7 @@ class Coach:
     Trainer class for joint training of the hypernetwork (which generates the physics network parameters)
     and the physics network itself, with evaluation on test data to monitor overfitting.
     """
-    def __init__( self, model, dataBase, device, resolution=10, lr=1e-3):
+    def __init__( self, model, dataBase, device, resolution=2, lr=1e-3):
         """
         Parameters:
           - model: An instance of DeepPhysiNet.
@@ -273,119 +275,73 @@ class Coach:
         self.train_loader = self.dataBase.get_train_loader(shuffle=True)
         self.test_within_loader = self.dataBase.get_test_within_loader(shuffle=False)
         self.test_unseen_loader = self.dataBase.get_test_unseen_loader(shuffle=False)
-
+        print("Dataset loaded")
         # Initialize TensorBoard SummaryWriter.
         # We use the same API.config.LOGS_DIR used for saving plots, appending a subfolder.
         self.writer = SummaryWriter(log_dir=API.config.LOGS_DIR + '/tensorboard')
-    
+
     def evaluate(self, loader, high_res_eval=False):
-        """Evaluate the model on a given data loader and return the average loss."""
+        """Evaluate the model on a given data loader.
+        
+        If high_res_eval is True, use the full high-res half (i.e. full_time/full_state).
+        Otherwise, use only the grid points.
+        Only the data (MSE) loss is computed.
+        """
         self.model.eval()
         total_loss = 0.0
         with torch.no_grad():
             for batch in loader:
                 context = batch['context'].to(self.device)
-                # For evaluation, if high_res_eval is True, use the full trajectory:
+                params = self.model.hypernet(context)
+                
                 if high_res_eval:
-                    full_time = batch['full_time'].to(self.device)  # full resolution times
-                    full_state = batch['full_state'].to(self.device)  # full resolution states
-                    full_time.requires_grad_()
-                    # Generate parameters once
-                    params = self.model.hypernet(context)
+                    full_time = batch['full_time'].to(self.device)      # (B, high_res_length, 1)
+                    full_state = batch['full_state'].to(self.device)    # (B, high_res_length, 3)
                     pred_full = self.model.physnet(full_time, params)
-                    loss, _, _ = self.loss_fn(full_time, pred_full, full_state)
+                    # Here we skip PDE loss.
+                    loss, _, _ = self.loss_fn(full_time, pred_full, full_state, compute_data_loss=True, skip_pde=True)
                 else:
-                    query_time = batch['available_time'].to(self.device)
-                    query_state = batch['available_state'].to(self.device)
-                    query_time.requires_grad_()
-                    pred = self.model(context, query_time)
-                    loss, _, _ = self.loss_fn(query_time, pred, query_state)
+                    grid_time = batch['grid_time'].to(self.device)      # (B, context_tokens, 1)
+                    grid_state = batch['grid_state'].to(self.device)    # (B, context_tokens, 3)
+                    pred = self.model.physnet(grid_time, params)
+                    loss, _, _ = self.loss_fn(grid_time, pred, grid_state, compute_data_loss=True, skip_pde=True)
+                        
                 total_loss += loss.item()
         avg_loss = total_loss / len(loader)
         self.model.train()
         return avg_loss
-    
+
+
     #need to test on unsee resolution also 
     def train(self, num_epochs=100):
-        """Train the model for a specified number of epochs.
-        For each training batch:
-        - Use the provided context (grid points for the hypernetwork).
-        - Generate a high-resolution time grid from the grid (available) times.
-        - Use the hypernetwork to generate physics network parameters (run once per batch).
-        - Query the physics network on the full high-res time grid.
-        - Extract predictions corresponding to the grid points (using torch.gather) and compute both data (MSE) and PDE losses.
-        - For the inner points (the extra high-res points), compute only the PDE loss.
-        - Sum the losses and backpropagate.
-        """
+        print("Start training")
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             for batch in self.train_loader:
                 self.optimizer.zero_grad()
                 
-                # Retrieve batch data and send to device.
-                context = batch['context'].to(self.device)  # For hypernetwork input.
-                grid_time = batch['available_time'].to(self.device)  # Grid (available) times. Shape: (B, num_grid, 1)
-                grid_state = batch['available_state'].to(self.device)  # Ground truth states for grid points. Shape: (B, num_grid, 3)
+                # Retrieve precomputed splits.
+                context   = batch['context'].to(self.device)      # (B, context_tokens, 4)
+                grid_time = batch['grid_time'].to(self.device)      # (B, context_tokens, 1)
+                grid_state= batch['grid_state'].to(self.device)     # (B, context_tokens, 3)
+                inner_time= batch['inner_time'].to(self.device)      # (B, inner_count, 1)
                 
-                # Enable gradient computation for time (needed for PDE loss).
+                # Enable gradients on time (needed for PDE loss)
                 grid_time.requires_grad_()
-                
-                B, num_grid, _ = grid_time.shape
-                total_points = int(num_grid * self.resolution)  # Total high-res points
-                
-                # Extract start and end times for each sample (shape: (B,))
-                t_start = grid_time[:, 0, 0]  # shape: (B,)
-                t_end   = grid_time[:, -1, 0]  # shape: (B,)
-
-                # Create a 1D vector of evenly spaced values from 0 to 1 (shape: (total_points,))
-                scaled = torch.linspace(0, 1, steps=total_points, device=self.device)  # shape: (total_points,)
-
-                # Compute high-resolution times using broadcasting:
-                # For each sample i, highres_time[i] = t_start[i] + (t_end[i] - t_start[i]) * scaled
-                highres_time = t_start.unsqueeze(1) + (t_end - t_start).unsqueeze(1) * scaled.unsqueeze(0)
-                # Add an extra dimension so that highres_time becomes (B, total_points, 1)
-                highres_time = highres_time.unsqueeze(-1)
-                highres_time.requires_grad_()
-                
-                # Compute indices for the grid points within the high-res grid.
-                # We assume that the grid times correspond to evenly spaced indices in the high-res grid.
-                grid_indices = torch.linspace(0, total_points - 1, steps=num_grid).long().to(self.device)  # Shape: (num_grid,)
-                
-                # --- Run the hypernetwork once for this batch ---
-                params = self.model.hypernet(context)
-                
-                # --- Query the physics network on the full high-resolution time grid ---
-                pred_all = self.model.physnet(highres_time, params)  # Shape: (B, total_points, 3)
-                
-                # --- Extract predictions corresponding to the grid points ---
-                # Expand grid_indices to have the same batch and feature dimensions.
-                grid_indices_expanded = grid_indices.unsqueeze(0).unsqueeze(-1).expand(B, num_grid, 3)
-                pred_grid = torch.gather(pred_all, dim=1, index=grid_indices_expanded)  # Shape: (B, num_grid, 3)
-                
-                # --- Extract inner (non-grid) predictions ---
-                # Create a boolean mask for the high-res time grid: True at grid indices, False elsewhere.
-                mask = torch.zeros(total_points, dtype=torch.bool, device=self.device)
-                mask[grid_indices] = True
-                inner_pred_list = []
-                inner_time_list = []
-                for i in range(B):
-                    inner_pred = pred_all[i][~mask]  # Predictions at inner points.
-                    inner_time = highres_time[i][~mask]  # Corresponding time values.
-                    inner_pred_list.append(inner_pred)
-                    inner_time_list.append(inner_time)
-                inner_pred = torch.stack(inner_pred_list, dim=0)  # Shape: (B, total_points - num_grid, 3)
-                inner_time = torch.stack(inner_time_list, dim=0)      # Shape: (B, total_points - num_grid, 1)
                 inner_time.requires_grad_()
                 
-                # --- Compute losses ---
-                # For grid points: compute data loss (comparing pred_grid and grid_state) and PDE loss.
+                # Generate dynamic parameters from context.
+                params = self.model.hypernet(context)
+                
+                # Predictions.
+                pred_grid  = self.model.physnet(grid_time, params)   # (B, context_tokens, 3)
+                pred_inner = self.model.physnet(inner_time, params)   # (B, inner_count, 3)
+                
+                # Compute losses.
                 loss_grid, data_loss, pde_loss_grid = self.loss_fn(grid_time, pred_grid, grid_state, compute_data_loss=True)
-                # For inner points: compute only the PDE loss (since ground truth is not available).
-                loss_inner, _, pde_loss_inner = self.loss_fn(inner_time, inner_pred, None, compute_data_loss=False)
+                loss_inner, _, pde_loss_inner = self.loss_fn(inner_time, pred_inner, None, compute_data_loss=False)
                 
-                # Total loss is the sum of grid loss and inner loss.
                 total_loss = loss_grid + loss_inner
-                
                 total_loss.backward()
                 self.optimizer.step()
                 
@@ -395,15 +351,87 @@ class Coach:
             test_within_loss = self.evaluate(self.test_within_loader)
             test_unseen_loss = self.evaluate(self.test_unseen_loader)
             
-            # Log the losses to TensorBoard.
             self.writer.add_scalar('Loss/Train', avg_train_loss, epoch)
             self.writer.add_scalar('Loss/Test_Within', test_within_loss, epoch)
             self.writer.add_scalar('Loss/Test_Unseen', test_unseen_loss, epoch)
             
-            print(f"Epoch [{epoch+1}/{num_epochs}] | Train Loss: {avg_train_loss:.6f} | "
-                f"Test Within Loss: {test_within_loss:.6f} | Test Unseen Loss: {test_unseen_loss:.6f}")
+            print(f"Epoch [{epoch+1}/{num_epochs}] | Train Loss: {avg_train_loss:.6f} | Test Within Loss: {test_within_loss:.6f} | Test Unseen Loss: {test_unseen_loss:.6f}")
         
-        # (After training, you can use evaluate() to assess performance on both grid and inner points.)
+        # Optionally call final_evaluate() after training.
+    def final_evaluate(self):
+        """
+        Performs a final evaluation using the full high-resolution half of the trajectory.
+        For each batch in the test_unseen_loader, the function:
+        - Uses the precomputed 'full_time' and 'full_state' (already in order).
+        - Generates predictions using the physics network (with parameters from the hypernetwork).
+        - Computes the data (MSE) loss between predictions and ground truth.
+        - Plots one sample's trajectory for visual inspection.
+        No gradients are computed during evaluation.
+        """
+        self.model.eval()
+        total_loss = 0.0
+        num_batches = 0
+
+        # For plotting a sample trajectory
+        sample_time_plot = None
+        sample_pred_plot = None
+        sample_gt_plot = None
+
+        with torch.no_grad():
+            for batch in self.test_unseen_loader:
+                # Move context and full high-res data to device.
+                context = batch['context'].to(self.device)           # (B, context_tokens, 4)
+                full_time = batch['full_time'].to(self.device)         # (B, high_res_length, 1)
+                full_state = batch['full_state'].to(self.device)       # (B, high_res_length, 3)
+                
+                # Generate dynamic parameters from context.
+                params = self.model.hypernet(context)
+                # Compute predictions for the entire high-res half.
+                pred_full = self.model.physnet(full_time, params)
+                # Compute loss using the data (MSE) loss (PDE loss is not used here).
+                loss, _, _ = self.loss_fn(full_time, pred_full, full_state, compute_data_loss=True, skip_pde=True)
+                
+                total_loss += loss.item()
+                num_batches += 1
+
+                # For plotting, take the first sample from the first batch.
+                if sample_time_plot is None:
+                    sample_time_plot = full_time[0].cpu().numpy().squeeze()   # shape: (high_res_length,)
+                    sample_pred_plot = pred_full[0].cpu().numpy()              # shape: (high_res_length, 3)
+                    sample_gt_plot   = full_state[0].cpu().numpy()             # shape: (high_res_length, 3)
+                    
+                    # Plot each coordinate versus time.
+                    plt.figure(figsize=(12, 8))
+                    
+                    plt.subplot(3, 1, 1)
+                    plt.plot(sample_time_plot, sample_pred_plot[:, 0], 'r-', label='Predicted x')
+                    plt.plot(sample_time_plot, sample_gt_plot[:, 0], 'b--', label='Ground Truth x')
+                    plt.ylabel('x')
+                    plt.legend()
+                    plt.grid(True)
+                    
+                    plt.subplot(3, 1, 2)
+                    plt.plot(sample_time_plot, sample_pred_plot[:, 1], 'r-', label='Predicted y')
+                    plt.plot(sample_time_plot, sample_gt_plot[:, 1], 'b--', label='Ground Truth y')
+                    plt.ylabel('y')
+                    plt.legend()
+                    plt.grid(True)
+                    
+                    plt.subplot(3, 1, 3)
+                    plt.plot(sample_time_plot, sample_pred_plot[:, 2], 'r-', label='Predicted z')
+                    plt.plot(sample_time_plot, sample_gt_plot[:, 2], 'b--', label='Ground Truth z')
+                    plt.xlabel('Time')
+                    plt.ylabel('z')
+                    plt.legend()
+                    plt.grid(True)
+                    
+                    plt.suptitle('Final Evaluation: Full Resolution Trajectory')
+                    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+                    plt.show()
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        print("Final Evaluation Loss (full resolution): {:.6f}".format(avg_loss))
+        self.model.train()
 
     def get_name(self):
 
@@ -443,47 +471,68 @@ class HybridLoss(nn.Module):
         self.sigma = sigma
         self.rho = rho
         self.beta = beta
-    
-
-    #so use forward twice ?
-    def forward(self, t, space_pred, space_true=None, compute_data_loss=True):
+        
+    def forward(self, t, space_pred, space_true=None, compute_data_loss=True, skip_pde=False):
         # Compute data loss only if requested and if ground truth is provided.
         if compute_data_loss and space_true is not None:
             data_loss = self.mse_loss(space_pred, space_true)
         else:
             data_loss = 0.0
 
-        # Compute derivatives using autograd
+        # If we want to skip the PDE loss (e.g. during evaluation), return only the data loss.
+        if skip_pde:
+            return data_loss, data_loss, 0.0
+
+        # Otherwise, compute the PDE loss.
+        # Ensure space_pred requires gradient
         space_pred = space_pred.requires_grad_(True)
-        dydt = torch.autograd.grad(
-            outputs=space_pred,
+        
+        # Compute each derivative separately.
+        dxdt_pred = torch.autograd.grad(
+            outputs=space_pred[..., 0],  # x component
             inputs=t,
-            grad_outputs=torch.ones_like(space_pred),
+            grad_outputs=torch.ones_like(space_pred[..., 0]),
             create_graph=True,
             retain_graph=True,
             only_inputs=True
-        )[0]  # Shape: (batch_size, 3)
+        )[0]
+        dydt_pred = torch.autograd.grad(
+            outputs=space_pred[..., 1],  # y component
+            inputs=t,
+            grad_outputs=torch.ones_like(space_pred[..., 1]),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+        dzdt_pred = torch.autograd.grad(
+            outputs=space_pred[..., 2],  # z component
+            inputs=t,
+            grad_outputs=torch.ones_like(space_pred[..., 2]),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
 
-        # Extract individual components
-        x_pred = space_pred[:, 0]
-        y_pred = space_pred[:, 1]
-        z_pred = space_pred[:, 2]
+        # Squeeze the last dimension if necessary
+        dxdt_pred = dxdt_pred.squeeze(-1)
+        dydt_pred = dydt_pred.squeeze(-1)
+        dzdt_pred = dzdt_pred.squeeze(-1)
 
-        dxdt_pred = dydt[:, 0]
-        dydt_pred = dydt[:, 1]
-        dzdt_pred = dydt[:, 2]
+        # Extract predictions.
+        x_pred = space_pred[..., 0]
+        y_pred = space_pred[..., 1]
+        z_pred = space_pred[..., 2]
 
-        # Define Lorenz ODEs
+        # Define Lorenz ODEs.
         dxdt_lorenz = self.sigma * (y_pred - x_pred)
         dydt_lorenz = x_pred * (self.rho - z_pred) - y_pred
         dzdt_lorenz = x_pred * y_pred - self.beta * z_pred
 
-        # Physics loss
+        # Compute physics loss for each coordinate.
         physics_loss_x = self.mse_loss(dxdt_pred, dxdt_lorenz)
         physics_loss_y = self.mse_loss(dydt_pred, dydt_lorenz)
         physics_loss_z = self.mse_loss(dzdt_pred, dzdt_lorenz)
         physics_loss = physics_loss_x + physics_loss_y + physics_loss_z
 
         total_loss = data_loss + physics_loss
-        #maybe we need to scale data loss for grid points since less numerous
         return total_loss, data_loss, physics_loss
