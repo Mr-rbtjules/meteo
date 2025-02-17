@@ -20,85 +20,25 @@ possibilités :
 
 
 class TrajectoryDataset(Dataset):
-    """
-    A Dataset that, for each trajectory, uses only the first half of the data
-    and splits it into three parts:
-      - context: a fixed number of points (e.g. 1000) sampled from the high-res version of the first half.
-      - grid: from the high-res version of the first half, a fixed number of points (e.g. 1000) evenly spaced.
-      - inner: the remaining points from the high-res version (used for PDE loss only).
-    """
-    def __init__(
-            self,
-            trajectories,
-            context_fraction=0.5,     # Use only the first half of the trajectory.
-            context_tokens=1000,      # Fixed number of points for context (and grid).
-            resolution_factor=2       # Total high-res points = resolution_factor * context_tokens.
-        ):
+    def __init__(self, reduced_trajectories):
         super(TrajectoryDataset, self).__init__()
-        self.trajectories = trajectories
-        self.context_fraction = context_fraction
-        self.context_tokens = context_tokens
-        self.resolution_factor = resolution_factor
+        self.reduced = reduced_trajectories
 
     def __len__(self):
-        return len(self.trajectories)
+        return len(self.reduced)
 
     def __getitem__(self, idx):
-        traj_sample = self.trajectories[idx]
-        time_arr = traj_sample['time']    # shape: (traj_steps, 1)
-        state_arr = traj_sample['state']   # shape: (traj_steps, 3)
-        traj_steps = time_arr.shape[0]
-
-        # Use only the first half of the trajectory.
-        half_steps = int(traj_steps * self.context_fraction)
-        if half_steps < self.context_tokens:
-            raise ValueError("Not enough points in the first half for the desired context_tokens.")
-
-        # Define the half portion.
-        time_half = time_arr[:half_steps]    # (half_steps, 1)
-        state_half = state_arr[:half_steps]   # (half_steps, 3)
-
-        # --- High-Resolution Sampling ---
-        # Total high-res points = resolution_factor * context_tokens
-        high_res_length = self.resolution_factor * self.context_tokens
-        # Evenly sample indices from 0 to half_steps-1.
-        indices_highres = np.linspace(0, half_steps - 1, num=high_res_length, dtype=int)
-        highres_time = time_half[indices_highres]    # (high_res_length, 1)
-        highres_state = state_half[indices_highres]   # (high_res_length, 3)
-
-        # Save the full high-res sample (already in order).
-        full_time = torch.tensor(highres_time, dtype=torch.float32)   # (high_res_length, 1)
-        full_state = torch.tensor(highres_state, dtype=torch.float32) # (high_res_length, 3)
-
-        # --- Context (for the hypernetwork) ---
-        # For simplicity, pick grid points by taking one every resolution_factor from the high-res sample.
-        indices_context = np.arange(0, high_res_length, self.resolution_factor)  # shape: (context_tokens,)
-        context_time = highres_time[indices_context]    # (context_tokens, 1)
-        context_state = highres_state[indices_context]  # (context_tokens, 3)
-        context = torch.cat([
-            torch.tensor(context_state, dtype=torch.float32),
-            torch.tensor(context_time, dtype=torch.float32)
-        ], dim=-1)  # (context_tokens, 4)
-
-        # --- Grid and Inner Splits ---
-        # Grid points: same as context selection.
-        grid_time = torch.tensor(highres_time[indices_context], dtype=torch.float32)   # (context_tokens, 1)
-        grid_state = torch.tensor(highres_state[indices_context], dtype=torch.float32) # (context_tokens, 3)
-        # Inner points: the remaining indices from the high-res sample.
-        all_indices = np.arange(high_res_length)
-        indices_inner = np.setdiff1d(all_indices, indices_context)
-        inner_time = torch.tensor(highres_time[indices_inner], dtype=torch.float32)    # (high_res_length - context_tokens, 1)
-        inner_state = torch.tensor(highres_state[indices_inner], dtype=torch.float32)  # (high_res_length - context_tokens, 3)
-
+        traj = self.reduced[idx]
+        # Convert arrays to torch tensors.
         return {
-            'context': context,           # (context_tokens, 4)
-            'grid_time': grid_time,       # (context_tokens, 1)
-            'grid_state': grid_state,     # (context_tokens, 3)
-            'inner_time': inner_time,     # (high_res_length - context_tokens, 1)
-            'inner_state': inner_state,   # (high_res_length - context_tokens, 3)
-            'full_time': full_time,       # (high_res_length, 1)
-            'full_state': full_state,     # (high_res_length, 3)
-            'zone': traj_sample['zone']
+            'context': torch.tensor(traj['context'], dtype=torch.float32),
+            'grid_time': torch.tensor(traj['grid_time'], dtype=torch.float32),
+            'grid_state': torch.tensor(traj['grid_state'], dtype=torch.float32),
+            'inner_time': torch.tensor(traj['inner_time'], dtype=torch.float32),
+            'inner_state': torch.tensor(traj['inner_state'], dtype=torch.float32),
+            'full_time': torch.tensor(traj['full_time'], dtype=torch.float32),
+            'full_state': torch.tensor(traj['full_state'], dtype=torch.float32),
+            'zone': traj['zone']
         }
 
     @classmethod
@@ -205,154 +145,192 @@ class DataBase:
     The master database object.
     
     This object loads the raw data from HDF5 files, performs normalization,
-    groups trajectories by zone, and then creates three dataset objects:
-      - train_dataset: trajectories from training zones (using a fraction for training)
-      - test_within_dataset: trajectories from training zones reserved for testing (initial condition sensitivity)
-      - test_unseen_dataset: trajectories from unseen zones
+    groups trajectories by zone, and then splits the dataset.
+    
+    We now add a reduction step so that for each trajectory we keep only the
+    necessary points (from the first half), already split into context, grid, inner, and full.
     """
-    def __init__(self, 
-                 context_fraction=0.5,
-                 context_tokens=1000,
-                 load_size=1
-        ):
+    def __init__(
+            self, context_fraction=0.5, 
+            context_tokens=1000, load_size=1,
+            max_files=50, resolution=2
+    ):
         self.load_size = load_size
+        self.max_files = max_files
         self.origin_path = Path(API.config.RAW_DATA_DIR) / "trajectories_dataset/"
         self.context_fraction = context_fraction
         self.train_zone_fraction = 1 - API.config.TEST_DATA_PROPORTION
         self.within_zone_test_fraction = API.config.TEST_DATA_PROPORTION
         self.batch_size = API.config.BATCH_SIZE
         self.context_tokens = context_tokens
+        self.resolution = resolution
 
         # Load trajectories (grouped by zone)
         self.zone2trajectories = self._load_trajectories()
-        #is a dict key = zone id, content = list of dict key = zone , state
-        #comme ça mm qd shuffle on sait origine des zones
-        #will point the same place as zone2traj
         self.all_trajectories = []
         for zone, traj_list in self.zone2trajectories.items():
-            #traj_list is a dict with 
             self.all_trajectories.extend(traj_list)
-        # Normalize globally
+        
+        # Normalize trajectories
         self._normalize_trajectories()
-        # Now split the dataset
+        # Split the dataset (train/test)
         self._split_dataset()
+        # Now, reduce each trajectory to the needed points.
+        self._reduce_trajectories()
 
     def _load_trajectories(self):
-        """
-        Load trajectories from HDF5 files.
-        Each file (named like "type_001.h5") corresponds to one zone.
-        Returns a dictionary mapping zone id to a list of trajectories.
-        """
         zone2traj = {}
+        # Get all files matching pattern.
         h5_files = list(self.origin_path.glob("type_*.h5"))
+        # Limit the number of files processed to max_files.
+        h5_files = h5_files[:self.max_files]
         for file_path in h5_files:
-            # Assume filename format "type_###.h5"
             zone_id = int(file_path.stem.split("_")[1])
             with h5py.File(file_path, 'r') as f:
-                zone_trajs = f['trajectories'][:int(len(f['trajectories'])*self.load_size)]  # shape: (n_similar, 3, traj_steps)
+                zone_trajs = f['trajectories'][:int(len(f['trajectories'])*self.load_size)]
                 traj_steps = zone_trajs.shape[2]
                 t_span = (0, 100)
-                # Create time vector if not stored
-                time_points = np.linspace(t_span[0], t_span[1], traj_steps).reshape(-1, 1)
                 traj_list = []
                 for sim in range(zone_trajs.shape[0]):
-                    traj = zone_trajs[sim].T  # (traj_steps, 3)
+                    traj = zone_trajs[sim].T  # shape: (traj_steps, 3)
                     traj_list.append({
-                        'zone': zone_id, #redondant 
-                        'time': time_points.copy(),
+                        'zone': zone_id,
+                        'time': np.linspace(t_span[0], t_span[1], traj_steps).reshape(-1, 1),
                         'state': traj
                     })
                 zone2traj[zone_id] = traj_list
-        print("Data loaded")
+        print("Data loaded from", len(h5_files), "files.")
         return zone2traj
 
     def _normalize_trajectories(self):
-        """
-        Normalize all trajectories globally using StandardScaler.
-        globally bc reference at same place
-        """
+        # (Your original normalization code.)
         all_time = np.concatenate([traj['time'] for traj in self.all_trajectories], axis=0)
         all_state = np.concatenate([traj['state'] for traj in self.all_trajectories], axis=0)
-        
         self.scaler_time = StandardScaler()
         self.scaler_state = StandardScaler()
         all_time_norm = self.scaler_time.fit_transform(all_time)
         all_state_norm = self.scaler_state.fit_transform(all_state)
-        
         start_idx = 0
         for traj in self.all_trajectories:
             n_points = traj['time'].shape[0]
-            traj['time'] = all_time_norm[start_idx:start_idx + n_points]
-            traj['state'] = all_state_norm[start_idx:start_idx + n_points]
+            traj['time'] = all_time_norm[start_idx:start_idx+n_points]
+            traj['state'] = all_state_norm[start_idx:start_idx+n_points]
             start_idx += n_points
         print("Data normalized")
 
     def _split_dataset(self):
-        """
-        Create three lists of trajectories:
-          - train_list: trajectories from training zones for training.
-          - test_within_list: trajectories from training zones reserved as test samples (for initial condition sensitivity).
-          - test_unseen_list: trajectories from zones not used for training.
-        """
+        # (Your original code splitting trajectories into train_list, test_within_list, test_unseen_list)
         all_zones = sorted(self.zone2trajectories.keys())
         n_train_zones = int(len(all_zones) * self.train_zone_fraction)
         train_zone_ids = all_zones[:n_train_zones]
         unseen_zone_ids = all_zones[n_train_zones:]
-
         self.train_zone_ids = train_zone_ids
         self.unseen_zone_ids = unseen_zone_ids
 
         train_list = []
         test_within_list = []
-        # Split trajectories within each training zone.
         for zone in train_zone_ids:
             trajs = self.zone2trajectories[zone]
             train_trajs, test_trajs = train_test_split(
                 trajs, 
                 test_size=self.within_zone_test_fraction,
-                random_state=API.config.SEED_SHUFFLE) #shuffle for split not zones
+                random_state=API.config.SEED_SHUFFLE)
             train_list.extend(train_trajs)
             test_within_list.extend(test_trajs)
-
         test_unseen_list = []
         for zone in unseen_zone_ids:
             test_unseen_list.extend(self.zone2trajectories[zone])
-
         self.train_list = train_list
         self.test_within_list = test_within_list
         self.test_unseen_list = test_unseen_list
         print("Data splitted")
 
+    def _reduce_trajectories(self):
+        """
+        For each trajectory in all_trajectories, compute the reduced version and store it.
+        Then, discard the full raw trajectories.
+        """
+        reduced_list = []
+        # Iterate over every trajectory in the full dataset.
+        for traj in self.all_trajectories:
+            time_arr = traj['time']   # (traj_steps, 1) numpy array
+            state_arr = traj['state'] # (traj_steps, 3) numpy array
+            traj_steps = time_arr.shape[0]
+            half_steps = int(traj_steps * self.context_fraction)
+            if half_steps < self.context_tokens:
+                continue  # or raise an error if desired
+            
+            # Use only the first half of the trajectory.
+            time_half = time_arr[:half_steps]
+            state_half = state_arr[:half_steps]
+            
+            # Define high_res_length = context_tokens * resolution_factor.
+            high_res_length = self.context_tokens * self.resolution
+            # Evenly sample indices from 0 to half_steps-1.
+            indices_highres = np.linspace(0, half_steps - 1, num=high_res_length, dtype=int)
+            highres_time = time_half[indices_highres]   # (high_res_length, 1)
+            highres_state = state_half[indices_highres] # (high_res_length, 3)
+            
+            # Precompute the full high-res sample.
+            full_time = highres_time.copy()
+            full_state = highres_state.copy()
+            
+            # Context (for hypernetwork): take one every RESOLUTION_FACTOR-th point.
+            indices_context = np.arange(0, high_res_length, self.resolution)
+            context_time = highres_time[indices_context]   # (context_tokens, 1)
+            context_state = highres_state[indices_context] # (context_tokens, 3)
+            context = np.concatenate([context_state, context_time], axis=1)  # (context_tokens, 4)
+            
+            # Grid: same as context.
+            grid_time = context_time.copy()
+            grid_state = context_state.copy()
+            
+            # Inner: remaining points.
+            all_indices = np.arange(high_res_length)
+            indices_inner = np.setdiff1d(all_indices, indices_context)
+            inner_time = highres_time[indices_inner]
+            inner_state = highres_state[indices_inner]
+            
+            reduced_traj = {
+                'zone': traj['zone'],
+                'context': context,         # (context_tokens, 4)
+                'grid_time': grid_time,     # (context_tokens, 1)
+                'grid_state': grid_state,   # (context_tokens, 3)
+                'inner_time': inner_time,   # (high_res_length - context_tokens, 1)
+                'inner_state': inner_state, # (high_res_length - context_tokens, 3)
+                'full_time': full_time,     # (high_res_length, 1)
+                'full_state': full_state    # (high_res_length, 3)
+            }
+            reduced_list.append(reduced_traj)
+        
+        # After processing, discard the full trajectories to free memory.
+        self.all_trajectories.clear()
+        
+        
+        # Split reduced trajectories into train, test_within, and test_unseen lists.
+        self.train_list = [traj for traj in reduced_list if traj['zone'] in self.train_zone_ids]
+        self.test_within_list = [traj for traj in reduced_list if traj['zone'] in self.train_zone_ids]
+        self.test_unseen_list = [traj for traj in reduced_list if traj['zone'] in self.unseen_zone_ids]
+        print("Reduced trajectories prepared and full raw data discarded.")
+
+
     def get_train_loader(self, shuffle=True):
-        train_dataset = TrajectoryDataset(
-            self.train_list, 
-            context_fraction=self.context_fraction,
-            context_tokens=self.context_tokens
-        )
+        train_dataset = TrajectoryDataset(self.train_list)
         return DataLoader(
             train_dataset, batch_size=self.batch_size, 
-            shuffle=shuffle, num_workers=4
-        )
+            shuffle=shuffle, num_workers=API.config.NUM_WORKERS
+            )
 
     def get_test_within_loader(self, shuffle=False):
-        test_within_dataset = TrajectoryDataset(
-            self.test_within_list, 
-            context_fraction=self.context_fraction,
-            context_tokens=self.context_tokens
-        )
+        test_within_dataset = TrajectoryDataset(self.test_within_list)
         return DataLoader(
-            test_within_dataset, batch_size=self.batch_size, 
-            shuffle=shuffle, num_workers=4
-        )
+            test_within_dataset, batch_size=self.batch_size,
+            shuffle=shuffle, num_workers=API.config.NUM_WORKERS
+            )
 
     def get_test_unseen_loader(self, shuffle=False):
-        test_unseen_dataset = TrajectoryDataset(
-            self.test_unseen_list, 
-            context_fraction=self.context_fraction,
-            context_tokens=self.context_tokens
-        )
+        test_unseen_dataset = TrajectoryDataset(self.test_unseen_list)
         return DataLoader(
-            test_unseen_dataset, batch_size=self.batch_size,
-            shuffle=shuffle, num_workers=4
-        )
-
+            test_unseen_dataset, batch_size=self.batch_size, 
+            shuffle=shuffle, num_workers=API.config.NUM_WORKERS
+            )
