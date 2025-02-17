@@ -11,6 +11,12 @@ import torch  # type: ignore
 from torch.utils.data import Dataset, DataLoader  # type: ignore
 import random
 
+"""
+possibilités : 
+-batch size
+-full dataloading
+-too big precision
+"""
 
 
 class TrajectoryDataset(Dataset):

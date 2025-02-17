@@ -61,7 +61,9 @@ class HyperNet(nn.Module):
         self.seq_len = seq_len #nb of tokens, context
         self.embed_dim = embed_dim #dimension of the space the token is projected
         self.physnet_hidden = physnet_hidden #nb of neuron per layer in physnet
-        
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.num_tokens = num_tokens
         # --- Embedding Stage ---
         # Embed each spatiotemporal point (e.g., [x, y, z, t]) into a higher-dimensional space.
         self.input_embed = nn.Linear(input_dim, embed_dim)
@@ -356,82 +358,12 @@ class Coach:
             self.writer.add_scalar('Loss/Test_Unseen', test_unseen_loss, epoch)
             
             print(f"Epoch [{epoch+1}/{num_epochs}] | Train Loss: {avg_train_loss:.6f} | Test Within Loss: {test_within_loss:.6f} | Test Unseen Loss: {test_unseen_loss:.6f}")
-        
+                # At the very end of your train() method, after the epoch loop:
+        save_path = Path(API.config.MODELS_DIR) / (self.get_name() + ".pth")
+        torch.save(self.model.state_dict(), save_path)
+        print(f"Model saved to {save_path}")
         # Optionally call final_evaluate() after training.
-    def final_evaluate(self):
-        """
-        Performs a final evaluation using the full high-resolution half of the trajectory.
-        For each batch in the test_unseen_loader, the function:
-        - Uses the precomputed 'full_time' and 'full_state' (already in order).
-        - Generates predictions using the physics network (with parameters from the hypernetwork).
-        - Computes the data (MSE) loss between predictions and ground truth.
-        - Plots one sample's trajectory for visual inspection.
-        No gradients are computed during evaluation.
-        """
-        self.model.eval()
-        total_loss = 0.0
-        num_batches = 0
-
-        # For plotting a sample trajectory
-        sample_time_plot = None
-        sample_pred_plot = None
-        sample_gt_plot = None
-
-        with torch.no_grad():
-            for batch in self.test_unseen_loader:
-                # Move context and full high-res data to device.
-                context = batch['context'].to(self.device)           # (B, context_tokens, 4)
-                full_time = batch['full_time'].to(self.device)         # (B, high_res_length, 1)
-                full_state = batch['full_state'].to(self.device)       # (B, high_res_length, 3)
-                
-                # Generate dynamic parameters from context.
-                params = self.model.hypernet(context)
-                # Compute predictions for the entire high-res half.
-                pred_full = self.model.physnet(full_time, params)
-                # Compute loss using the data (MSE) loss (PDE loss is not used here).
-                loss, _, _ = self.loss_fn(full_time, pred_full, full_state, compute_data_loss=True, skip_pde=True)
-                
-                total_loss += loss.item()
-                num_batches += 1
-
-                # For plotting, take the first sample from the first batch.
-                if sample_time_plot is None:
-                    sample_time_plot = full_time[0].cpu().numpy().squeeze()   # shape: (high_res_length,)
-                    sample_pred_plot = pred_full[0].cpu().numpy()              # shape: (high_res_length, 3)
-                    sample_gt_plot   = full_state[0].cpu().numpy()             # shape: (high_res_length, 3)
-                    
-                    # Plot each coordinate versus time.
-                    plt.figure(figsize=(12, 8))
-                    
-                    plt.subplot(3, 1, 1)
-                    plt.plot(sample_time_plot, sample_pred_plot[:, 0], 'r-', label='Predicted x')
-                    plt.plot(sample_time_plot, sample_gt_plot[:, 0], 'b--', label='Ground Truth x')
-                    plt.ylabel('x')
-                    plt.legend()
-                    plt.grid(True)
-                    
-                    plt.subplot(3, 1, 2)
-                    plt.plot(sample_time_plot, sample_pred_plot[:, 1], 'r-', label='Predicted y')
-                    plt.plot(sample_time_plot, sample_gt_plot[:, 1], 'b--', label='Ground Truth y')
-                    plt.ylabel('y')
-                    plt.legend()
-                    plt.grid(True)
-                    
-                    plt.subplot(3, 1, 3)
-                    plt.plot(sample_time_plot, sample_pred_plot[:, 2], 'r-', label='Predicted z')
-                    plt.plot(sample_time_plot, sample_gt_plot[:, 2], 'b--', label='Ground Truth z')
-                    plt.xlabel('Time')
-                    plt.ylabel('z')
-                    plt.legend()
-                    plt.grid(True)
-                    
-                    plt.suptitle('Final Evaluation: Full Resolution Trajectory')
-                    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-                    plt.show()
-
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-        print("Final Evaluation Loss (full resolution): {:.6f}".format(avg_loss))
-        self.model.train()
+    
 
     def get_name(self):
 
