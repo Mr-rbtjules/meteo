@@ -316,6 +316,7 @@ class DataBase:
 
     def get_train_loader(self, shuffle=True):
         train_dataset = TrajectoryDataset(self.train_list)
+        #!! num of worker better low
         return DataLoader(
             train_dataset, batch_size=self.batch_size, 
             shuffle=shuffle, num_workers=API.config.NUM_WORKERS
@@ -332,5 +333,4 @@ class DataBase:
         test_unseen_dataset = TrajectoryDataset(self.test_unseen_list)
         return DataLoader(
             test_unseen_dataset, batch_size=self.batch_size, 
-            shuffle=shuffle, num_workers=API.config.NUM_WORKERS
-            )
+            shuffle=shuffle, num_workers=API.config.NUM_WORKERS)

@@ -16,8 +16,10 @@ SEED_NP = 4
 SEED_RAND = 5
 SEED_SHUFFLE = 6
 TEST_DATA_PROPORTION = 0.2
-BATCH_SIZE = 32
-NUM_WORKERS = 7
+BATCH_SIZE = 16
+#more than one if non trivial computation in getitem
+NUM_WORKERS = 1 #more than 1 = slower wtf => keep low for low data
+
 
 """
 #seed for data shuffle

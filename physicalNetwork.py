@@ -371,7 +371,7 @@ class Coach:
         name = "cS" + str(self.model.hypernet.seq_len) + "_eD" + str(self.model.hypernet.embed_dim) + \
             "_nL" + str(self.model.hypernet.num_layers) + "_nH" + str(self.model.hypernet.num_heads) \
             + "_nT" + str(self.model.hypernet.num_tokens) + "_rl" + str(self.resolution) \
-            + "_cF" + str(self.dataBase.context_fraction)
+            + "_cF" + str(self.dataBase.context_fraction) + "_dS" + str(self.dataBase.load_size)
         return name
 
     def plot_loss_curves(
@@ -441,7 +441,7 @@ class HybridLoss(nn.Module):
             inputs=t,
             grad_outputs=torch.ones_like(space_pred[..., 2]),
             create_graph=True,
-            retain_graph=True,
+            retain_graph=False,# for the last one retain_graph=True,
             only_inputs=True
         )[0]
 
