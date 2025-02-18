@@ -8,6 +8,7 @@ import torch.optim as optim # type: ignore
 import torch.nn.functional as F # type: ignore
 from torch.utils.tensorboard import SummaryWriter # type: ignore
 from pathlib import Path
+import torch.profiler
 
 class HybridNet(nn.Module):
     def __init__(
@@ -280,7 +281,10 @@ class Coach:
         print("Dataset loaded")
         # Initialize TensorBoard SummaryWriter.
         # We use the same API.config.LOGS_DIR used for saving plots, appending a subfolder.
-        self.writer = SummaryWriter(log_dir=API.config.LOGS_DIR + '/tensorboard')
+        log_dir = Path(API.config.LOGS_DIR) / "tensorboard" / self.get_name()
+        log_dir.mkdir(parents=True, exist_ok=True)  # create directory if it doesn't exist
+        self.writer = SummaryWriter(log_dir=str(log_dir))
+
 
     def evaluate(self, loader, high_res_eval=False):
         #set to false for training , not testing mode
@@ -317,6 +321,7 @@ class Coach:
     #need to test on unsee resolution also 
     def train(self, num_epochs=100):
         print("Start training")
+    
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             for batch in self.train_loader:
