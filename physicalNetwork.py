@@ -283,8 +283,8 @@ class Coach:
         self.writer = SummaryWriter(log_dir=API.config.LOGS_DIR + '/tensorboard')
 
     def evaluate(self, loader, high_res_eval=False):
+        #set to false for training , not testing mode
         """Evaluate the model on a given data loader.
-        
         If high_res_eval is True, use the full high-res half (i.e. full_time/full_state).
         Otherwise, use only the grid points.
         Only the data (MSE) loss is computed.
@@ -441,7 +441,7 @@ class HybridLoss(nn.Module):
             inputs=t,
             grad_outputs=torch.ones_like(space_pred[..., 2]),
             create_graph=True,
-            retain_graph=False,# for the last one retain_graph=True,
+            retain_graph=True,# for the last one retain_graph=True,
             only_inputs=True
         )[0]
 
