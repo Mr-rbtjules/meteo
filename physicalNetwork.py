@@ -350,6 +350,7 @@ class Coach:
                 
                 total_loss = loss_grid + loss_inner
                 total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)#+15pp
                 self.optimizer.step()
                 
                 epoch_loss += total_loss.item()

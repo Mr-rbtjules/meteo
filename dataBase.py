@@ -19,6 +19,12 @@ possibilités :
 """
 
 
+def worker_init_fn(worker_id):
+    base_seed = API.config.SEED_TORCH  # make sure you set this in your config
+    np.random.seed(base_seed + worker_id)
+    random.seed(base_seed + worker_id)
+
+
 class TrajectoryDataset(Dataset):
     def __init__(self, reduced_trajectories):
         super(TrajectoryDataset, self).__init__()
@@ -106,6 +112,7 @@ class TrajectoryDataset(Dataset):
             initial_state_base, t_span,
             h, sigma, rho, beta, output_dir
         ):
+        """save only with step of 0.01 but compute precision of 1e-5"""
         PERTURBATION = 0.05
         print("start job")
         file_name = os.path.join(output_dir, f"type_{type_idx:03d}.h5")
@@ -152,8 +159,8 @@ class DataBase:
     """
     def __init__(
             self, context_fraction=0.5, 
-            context_tokens=1000, load_size=1,
-            max_files=50, resolution=2
+            context_tokens=100, load_size=0.1,
+            max_files=100, resolution=1, animation=False
     ):
         self.load_size = load_size
         self.max_files = max_files
@@ -164,6 +171,8 @@ class DataBase:
         self.batch_size = API.config.BATCH_SIZE
         self.context_tokens = context_tokens
         self.resolution = resolution
+        self.animation = animation
+        self.animation_data = None
 
         # Load trajectories (grouped by zone)
         self.zone2trajectories = self._load_trajectories()
@@ -176,7 +185,8 @@ class DataBase:
         # Split the dataset (train/test)
         self._split_dataset()
         # Now, reduce each trajectory to the needed points.
-        self._reduce_trajectories()
+        if not animation:
+            self._reduce_trajectories()
 
     def _load_trajectories(self):
         zone2traj = {}
@@ -245,6 +255,7 @@ class DataBase:
         self.test_unseen_list = test_unseen_list
         print("Data splitted")
 
+
     def _reduce_trajectories(self):
         """
         For each trajectory in all_trajectories, compute the reduced version and store it.
@@ -256,9 +267,10 @@ class DataBase:
             time_arr = traj['time']   # (traj_steps, 1) numpy array
             state_arr = traj['state'] # (traj_steps, 3) numpy array
             traj_steps = time_arr.shape[0]
+            print(traj_steps)
             half_steps = int(traj_steps * self.context_fraction)
             if half_steps < self.context_tokens:
-                continue  # or raise an error if desired
+                print("error")
             
             # Use only the first half of the trajectory.
             time_half = time_arr[:half_steps]
@@ -313,14 +325,16 @@ class DataBase:
         self.test_unseen_list = [traj for traj in reduced_list if traj['zone'] in self.unseen_zone_ids]
         print("Reduced trajectories prepared and full raw data discarded.")
 
-
     def get_train_loader(self, shuffle=True):
         train_dataset = TrajectoryDataset(self.train_list)
-        #!! num of worker better low
         return DataLoader(
-            train_dataset, batch_size=self.batch_size, 
-            shuffle=shuffle, num_workers=API.config.NUM_WORKERS
-            )
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+            num_workers=API.config.NUM_WORKERS,
+            worker_init_fn=worker_init_fn,
+            pin_memory=True  # if you're using CUDA; omit if not
+        )
 
     def get_test_within_loader(self, shuffle=False):
         test_within_dataset = TrajectoryDataset(self.test_within_list)
@@ -334,3 +348,97 @@ class DataBase:
         return DataLoader(
             test_unseen_dataset, batch_size=self.batch_size, 
             shuffle=shuffle, num_workers=API.config.NUM_WORKERS)
+        
+    def prepare_data_for_animation(self, zone=99, idx=2):
+        """
+        Prepares data for animation for a single trajectory from the specified zone.
+        The raw normalized trajectory (from t = 0 to 100 s) is originally saved at 0.01 s resolution
+        (via save_interval=1000). Now, we downsample further to have a 0.1 s resolution for animation
+        (i.e. one point every 10 points).
+        
+        We also extract the context from the first half (0 to 50 s) by sampling
+        context_tokens evenly spaced points. The full trajectory is then denormalized for visualization.
+        
+        The resulting dictionary (stored in self.animation_data) contains:
+        - 'context_norm': normalized context (shape: [context_tokens, 4]),
+        - 'full_time_norm': normalized full time (shape: [T_anim, 1]) with ~0.1 s steps,
+        - 'full_state_norm': normalized full state (shape: [T_anim, 3]),
+        - 'full_time': denormalized full time,
+        - 'full_state': denormalized full state.
+        """
+        try:
+            traj = self.zone2trajectories[zone][idx]
+        except KeyError:
+            raise ValueError(f"No trajectory found for zone {zone}")
+        
+        norm_time = traj['time']    # shape: (traj_steps, 1) – already normalized
+        norm_state = traj['state']  # shape: (traj_steps, 3) – already normalized
+        traj_steps = norm_time.shape[0]
+        
+        # Extract context from the first half (t in [0,50] s)
+        T_half = traj_steps // 2
+        if T_half < self.context_tokens:
+            raise ValueError("Not enough points in the first half for the desired context_tokens.")
+        indices_context = np.linspace(0, T_half - 1, num=self.context_tokens, dtype=int)
+        context_time_norm = norm_time[:T_half][indices_context]  # (context_tokens, 1)
+        context_state_norm = norm_state[:T_half][indices_context]  # (context_tokens, 3)
+        context_norm = np.concatenate([context_state_norm, context_time_norm], axis=1)  # (context_tokens, 4)
+        
+        # Downsample full trajectory: 
+        # Originally, points are at 0.01 s resolution. To get a 0.1 s resolution, we take every 10th point.
+        indices_anim = np.arange(0, traj_steps, 10)  # downsample by factor of 10
+        full_time_norm = norm_time[indices_anim]    # (T_anim, 1)
+        full_state_norm = norm_state[indices_anim]  # (T_anim, 3)
+        
+        # Denormalize full trajectory for ground-truth animation.
+        full_time_denorm = self.scaler_time.inverse_transform(full_time_norm)
+        full_state_denorm = self.scaler_state.inverse_transform(full_state_norm)
+        
+        self.animation_data = {
+            'context_norm': context_norm,         # remains normalized, for model input
+            'full_time_norm': full_time_norm,       # normalized full time (now with 0.1 s resolution)
+            'full_state_norm': full_state_norm,     # normalized full state (if needed)
+            'full_time': full_time_denorm,          # denormalized full time for animation
+            'full_state': full_state_denorm         # denormalized full state for ground truth animation
+        }
+        print("Animation data prepared.")
+
+"""
+    def prepare_data_for_animation(self, zone=99, idx=0):
+        try:
+            traj = self.zone2trajectories[zone][idx]
+        except KeyError:
+            raise ValueError(f"No trajectory found for zone {zone}")
+        
+        norm_time = traj['time']    # shape: (traj_steps, 1)
+        norm_state = traj['state']  # shape: (traj_steps, 3)
+        traj_steps = norm_time.shape[0]
+        
+        # Context: from first half (0 to 50 s)
+        T_half = traj_steps // 2
+        if T_half < self.context_tokens:
+            raise ValueError("Not enough points in the first half for the desired context_tokens.")
+        indices_context = np.linspace(0, T_half - 1, num=self.context_tokens, dtype=int)
+        context_time_norm = norm_time[:T_half][indices_context]
+        context_state_norm = norm_state[:T_half][indices_context]
+        context_norm = np.concatenate([context_state_norm, context_time_norm], axis=1)
+        
+        # Animation data: full trajectory, but downsample to one point every 1000 points
+        indices_anim = np.arange(0, traj_steps, 1000)
+        full_time_norm = norm_time[indices_anim]
+        full_state_norm = norm_state[indices_anim]
+        
+        # Denormalize all
+        full_time_denorm = self.scaler_time.inverse_transform(full_time_norm)
+        full_state_denorm = self.scaler_state.inverse_transform(full_state_norm)
+        
+        self.animation_data = {
+            'context_norm': context_norm,         # still normalized, for feeding to the model
+            'full_time_norm': full_time_norm,       # normalized full time, to feed to model
+            'full_state_norm': full_state_norm,     # normalized full state (for evaluation if needed)
+            'full_time': full_time_denorm,          # denormalized full time for animation
+            'full_state': full_state_denorm         # denormalized full state for ground truth animation
+        }
+        print("Animation data prepared.")
+
+"""
