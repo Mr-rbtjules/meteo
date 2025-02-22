@@ -274,6 +274,8 @@ class Coach:
         self.optimizer = optim.Adam(model.parameters(), lr=lr)
         self.device = device
         self.dataBase = dataBase
+        self.t_min = dataBase.t_min
+        self.t_max = dataBase.t_max
         self.resolution = resolution
         self.train_loader = self.dataBase.get_train_loader(shuffle=True)
         self.test_within_loader = self.dataBase.get_test_within_loader(shuffle=False)
@@ -333,21 +335,25 @@ class Coach:
                 grid_state= batch['grid_state'].to(self.device)     # (B, context_tokens, 3)
                 inner_time= batch['inner_time'].to(self.device)      # (B, inner_count, 1)
                 
-                # Enable gradients on time (needed for PDE loss)
-                grid_time.requires_grad_()
-                inner_time.requires_grad_()
-                
-                # Generate dynamic parameters from context.
+
+                grid_time_real  = self.inverse_time_norm(grid_time)
+                inner_time_real = self.inverse_time_norm(inner_time)
+
+                # 3) We need gradients on the *real* times for PDE
+                grid_time_real.requires_grad_()
+                inner_time_real.requires_grad_()
+                    # Generate dynamic parameters from context.
+
                 params = self.model.hypernet(context)
-                
+                    
                 # Predictions.
                 pred_grid  = self.model.physnet(grid_time, params)   # (B, context_tokens, 3)
                 pred_inner = self.model.physnet(inner_time, params)   # (B, inner_count, 3)
                 
                 # Compute losses.
-                loss_grid, data_loss, pde_loss_grid = self.loss_fn(grid_time, pred_grid, grid_state, compute_data_loss=True)
-                loss_inner, _, pde_loss_inner = self.loss_fn(inner_time, pred_inner, None, compute_data_loss=False)
-                
+                loss_grid, data_loss, pde_loss_grid = self.loss_fn(grid_time_real, pred_grid, grid_state, compute_data_loss=True)
+                loss_inner, _, pde_loss_inner = self.loss_fn(inner_time_real, pred_inner, None, compute_data_loss=False)
+
                 total_loss = loss_grid + loss_inner
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)#+15pp
@@ -369,7 +375,13 @@ class Coach:
         torch.save(self.model.state_dict(), save_path)
         print(f"Model saved to {save_path}")
         # Optionally call final_evaluate() after training.
-    
+
+    def inverse_time_norm(self, t_norm):
+        """
+        Convert normalized time t_norm back to real time 
+        using min-max scaling with self.t_min, self.t_max.
+        """
+        return t_norm * (self.t_max - self.t_min) + self.t_min
 
     def get_name(self):
 
@@ -402,14 +414,13 @@ class Coach:
         plt.show()
 
 class HybridLoss(nn.Module):
-    def __init__(self, scaler_y, sigma=10.0, rho=28.0, beta=8.0/3.0):
+    def __init__(self, sigma=10.0, rho=28.0, beta=8.0/3.0):
         super(HybridLoss, self).__init__()
         self.mse_loss = nn.MSELoss()
-        self.scaler_y = scaler_y  # To inverse transform if necessary
         self.sigma = sigma
         self.rho = rho
         self.beta = beta
-        
+
     def forward(self, t, space_pred, space_true=None, compute_data_loss=True, skip_pde=False):
         # Compute data loss only if requested and if ground truth is provided.
         if compute_data_loss and space_true is not None:

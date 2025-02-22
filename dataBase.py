@@ -173,7 +173,9 @@ class DataBase:
         self.resolution = resolution
         self.animation = animation
         self.animation_data = None
-
+        
+        self.t_min = None
+        self.t_max = None
         # Load trajectories (grouped by zone)
         self.zone2trajectories = self._load_trajectories()
         self.all_trajectories = []
@@ -216,15 +218,21 @@ class DataBase:
         # (Your original normalization code.)
         all_time = np.concatenate([traj['time'] for traj in self.all_trajectories], axis=0)
         all_state = np.concatenate([traj['state'] for traj in self.all_trajectories], axis=0)
-        self.scaler_time = StandardScaler()
-        self.scaler_state = StandardScaler()
-        all_time_norm = self.scaler_time.fit_transform(all_time)
-        all_state_norm = self.scaler_state.fit_transform(all_state)
+        #  Compute global min/max
+        self.t_min = 0#all_time.min()
+        self.t_max =100 # all_time.max()
+        # 3) Min–max scaling
+        # Make sure t_max != t_min (or handle edge case).
+        all_time_norm = (all_time - self.t_min) / (self.t_max - self.t_min)
+
+        # 4) Store them so you can invert later (we'll store in self.time_min, self.time_max).
+        self.time_min = self.t_min
+        self.time_max = self.t_max
         start_idx = 0
         for traj in self.all_trajectories:
             n_points = traj['time'].shape[0]
             traj['time'] = all_time_norm[start_idx:start_idx+n_points]
-            traj['state'] = all_state_norm[start_idx:start_idx+n_points]
+            traj['state'] = all_state[start_idx:start_idx+n_points]
             start_idx += n_points
         print("Data normalized")
 
@@ -267,20 +275,19 @@ class DataBase:
             time_arr = traj['time']   # (traj_steps, 1) numpy array
             state_arr = traj['state'] # (traj_steps, 3) numpy array
             traj_steps = time_arr.shape[0]
-            print(traj_steps)
-            half_steps = int(traj_steps * self.context_fraction)
-            if half_steps < self.context_tokens:
-                print("error")
+            context_steps = int(traj_steps * self.context_fraction)
+            if context_steps < self.context_tokens:
+                continue  # or raise an error if desired
             
             # Use only the first half of the trajectory.
-            time_half = time_arr[:half_steps]
-            state_half = state_arr[:half_steps]
+            time_context = time_arr[:context_steps]
+            state_half = state_arr[:context_steps]
             
             # Define high_res_length = context_tokens * resolution_factor.
             high_res_length = self.context_tokens * self.resolution
             # Evenly sample indices from 0 to half_steps-1.
-            indices_highres = np.linspace(0, half_steps - 1, num=high_res_length, dtype=int)
-            highres_time = time_half[indices_highres]   # (high_res_length, 1)
+            indices_highres = np.linspace(0, context_steps - 1, num=high_res_length, dtype=int)
+            highres_time = time_context[indices_highres]   # (high_res_length, 1)
             highres_state = state_half[indices_highres] # (high_res_length, 3)
             
             # Precompute the full high-res sample.
@@ -349,7 +356,7 @@ class DataBase:
             test_unseen_dataset, batch_size=self.batch_size, 
             shuffle=shuffle, num_workers=API.config.NUM_WORKERS)
         
-    def prepare_data_for_animation(self, zone=99, idx=2):
+    def prepare_data_for_animation(self, zone=99, idx=0):
         """
         Prepares data for animation for a single trajectory from the specified zone.
         The raw normalized trajectory (from t = 0 to 100 s) is originally saved at 0.01 s resolution

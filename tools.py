@@ -37,7 +37,7 @@ def batched_linear(x, weight, bias):
     if out.size(1) == 1:
         return out.squeeze(1)
     return out
- 
+
 
 ###LORENZ SIMULATION###
 cache = False
