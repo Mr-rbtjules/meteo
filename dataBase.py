@@ -44,8 +44,15 @@ class TrajectoryDataset(Dataset):
             'inner_state': torch.tensor(traj['inner_state'], dtype=torch.float32),
             'full_time': torch.tensor(traj['full_time'], dtype=torch.float32),
             'full_state': torch.tensor(traj['full_state'], dtype=torch.float32),
-            'zone': traj['zone']
+            'zone': traj['zone'],
+
+            # Denormalized fields
+            'denorm_grid_state': torch.tensor(traj['denorm_grid_state'], dtype=torch.float32),
+            'denorm_inner_state': torch.tensor(traj['denorm_inner_state'], dtype=torch.float32),
+            'denorm_grid_time': torch.tensor(traj['denorm_grid_time'], dtype=torch.float32),
+            'denorm_inner_time': torch.tensor(traj['denorm_inner_time'], dtype=torch.float32)
         }
+        
 
     @classmethod
     def createDbFromScratch(cls, output_dir, zones=100) -> None:
@@ -173,6 +180,7 @@ class DataBase:
         self.resolution = resolution
         self.animation = animation
         self.animation_data = None
+        self.scaler_state = StandardScaler()
         
         self.t_min = None
         self.t_max = None
@@ -224,6 +232,7 @@ class DataBase:
         # 3) Min–max scaling
         # Make sure t_max != t_min (or handle edge case).
         all_time_norm = (all_time - self.t_min) / (self.t_max - self.t_min)
+        all_state_norm = self.scaler_state.fit_transform(all_state)
 
         # 4) Store them so you can invert later (we'll store in self.time_min, self.time_max).
         self.time_min = self.t_min
@@ -232,7 +241,7 @@ class DataBase:
         for traj in self.all_trajectories:
             n_points = traj['time'].shape[0]
             traj['time'] = all_time_norm[start_idx:start_idx+n_points]
-            traj['state'] = all_state[start_idx:start_idx+n_points]
+            traj['state'] = all_state_norm[start_idx:start_idx+n_points]
             start_idx += n_points
         print("Data normalized")
 
@@ -277,7 +286,7 @@ class DataBase:
             traj_steps = time_arr.shape[0]
             context_steps = int(traj_steps * self.context_fraction)
             if context_steps < self.context_tokens:
-                continue  # or raise an error if desired
+                raise ValueError("too many token")  # or raise an error if desired
             
             # Use only the first half of the trajectory.
             time_context = time_arr[:context_steps]
@@ -310,6 +319,11 @@ class DataBase:
             inner_time = highres_time[indices_inner]
             inner_state = highres_state[indices_inner]
             
+            denorm_grid_state = self.scaler_state.inverse_transform(grid_state)
+            denorm_inner_state = self.scaler_state.inverse_transform(inner_state)
+            denorm_grid_time = self.inverse_time_norm(grid_time)
+            denorm_inner_time = self.inverse_time_norm(inner_time)
+
             reduced_traj = {
                 'zone': traj['zone'],
                 'context': context,         # (context_tokens, 4)
@@ -318,7 +332,11 @@ class DataBase:
                 'inner_time': inner_time,   # (high_res_length - context_tokens, 1)
                 'inner_state': inner_state, # (high_res_length - context_tokens, 3)
                 'full_time': full_time,     # (high_res_length, 1)
-                'full_state': full_state    # (high_res_length, 3)
+                'full_state': full_state,    # (high_res_length, 3)
+                'denorm_grid_state' : denorm_grid_state,
+                'denorm_inner_state' : denorm_inner_state,
+                'denorm_grid_time' : denorm_grid_time,
+                'denorm_inner_time' :denorm_inner_time
             }
             reduced_list.append(reduced_traj)
         
@@ -339,8 +357,7 @@ class DataBase:
             batch_size=self.batch_size,
             shuffle=shuffle,
             num_workers=API.config.NUM_WORKERS,
-            worker_init_fn=worker_init_fn,
-            pin_memory=True  # if you're using CUDA; omit if not
+            worker_init_fn=worker_init_fn
         )
 
     def get_test_within_loader(self, shuffle=False):
@@ -356,59 +373,79 @@ class DataBase:
             test_unseen_dataset, batch_size=self.batch_size, 
             shuffle=shuffle, num_workers=API.config.NUM_WORKERS)
         
+
+
     def prepare_data_for_animation(self, zone=99, idx=0):
         """
         Prepares data for animation for a single trajectory from the specified zone.
-        The raw normalized trajectory (from t = 0 to 100 s) is originally saved at 0.01 s resolution
-        (via save_interval=1000). Now, we downsample further to have a 0.1 s resolution for animation
-        (i.e. one point every 10 points).
-        
-        We also extract the context from the first half (0 to 50 s) by sampling
-        context_tokens evenly spaced points. The full trajectory is then denormalized for visualization.
-        
-        The resulting dictionary (stored in self.animation_data) contains:
-        - 'context_norm': normalized context (shape: [context_tokens, 4]),
-        - 'full_time_norm': normalized full time (shape: [T_anim, 1]) with ~0.1 s steps,
-        - 'full_state_norm': normalized full state (shape: [T_anim, 3]),
-        - 'full_time': denormalized full time,
-        - 'full_state': denormalized full state.
+        1) Takes the first 'context_fraction' of points as "first half" (in terms of index count).
+        2) Picks 'context_tokens' evenly spaced indices within that half using integer steps.
+        3) Downsamples the entire trajectory by factor of 10 for animation frames.
+        4) Denormalizes time (and state if desired) for the final outputs.
+
+        The resulting dictionary (self.animation_data) contains:
+        - 'context_norm': context tokens in normalized form [ (x_norm, y_norm, z_norm, t_norm) ]
+        - 'full_time_norm': the downsampled times (normalized)
+        - 'full_state_norm': the downsampled states (normalized)
+        - 'full_time': denormalized times (for animation)
+        - 'full_state': denormalized states (if states are normalized and you inverse-transform them)
         """
         try:
             traj = self.zone2trajectories[zone][idx]
         except KeyError:
             raise ValueError(f"No trajectory found for zone {zone}")
-        
-        norm_time = traj['time']    # shape: (traj_steps, 1) – already normalized
-        norm_state = traj['state']  # shape: (traj_steps, 3) – already normalized
+
+        norm_time = traj['time']     # shape: (traj_steps, 1), normalized [0..1]
+        norm_state = traj['state']   # shape: (traj_steps, 3), normalized if you used scaler_state
         traj_steps = norm_time.shape[0]
-        
-        # Extract context from the first half (t in [0,50] s)
-        T_half = traj_steps // 2
-        if T_half < self.context_tokens:
-            raise ValueError("Not enough points in the first half for the desired context_tokens.")
-        indices_context = np.linspace(0, T_half - 1, num=self.context_tokens, dtype=int)
-        context_time_norm = norm_time[:T_half][indices_context]  # (context_tokens, 1)
-        context_state_norm = norm_state[:T_half][indices_context]  # (context_tokens, 3)
-        context_norm = np.concatenate([context_state_norm, context_time_norm], axis=1)  # (context_tokens, 4)
-        
-        # Downsample full trajectory: 
-        # Originally, points are at 0.01 s resolution. To get a 0.1 s resolution, we take every 10th point.
-        indices_anim = np.arange(0, traj_steps, 10)  # downsample by factor of 10
-        full_time_norm = norm_time[indices_anim]    # (T_anim, 1)
-        full_state_norm = norm_state[indices_anim]  # (T_anim, 3)
-        
-        # Denormalize full trajectory for ground-truth animation.
-        full_time_denorm = self.scaler_time.inverse_transform(full_time_norm)
-        full_state_denorm = self.scaler_state.inverse_transform(full_state_norm)
-        
+
+        # 1) Determine how many points go in the "first half"
+        #    e.g. if context_fraction=0.5 => half the array by index count
+        T_context = int(traj_steps * self.context_fraction)
+        if T_context < self.context_tokens:
+            raise ValueError(f"Not enough points ({T_context}) in the 'first half' for "
+                            f"context_tokens={self.context_tokens}.")
+
+        # 2) Build integer indices for the context points
+        #    We want 'context_tokens' evenly spaced indices up to T_context-1
+        step_size = max(1, T_context // self.context_tokens)  # integer spacing
+        indices_context = np.arange(0, T_context, step_size, dtype=int)
+        # If we ended up with too many indices (e.g. T_context=1000, context_tokens=100 => step=10 => 100 indices),
+        # just trim to exactly context_tokens
+        indices_context = indices_context[:self.context_tokens]
+
+        context_time_norm  = norm_time[indices_context]   # (context_tokens, 1)
+        context_state_norm = norm_state[indices_context]  # (context_tokens, 3)
+        # Combine state+time => shape (context_tokens,4)
+        context_norm = np.concatenate([context_state_norm, context_time_norm], axis=1)
+
+        # 3) Downsample the entire trajectory for animation frames (0.1 s if every 10th point)
+        downsample_factor = 10
+        indices_anim = np.arange(0, traj_steps, downsample_factor, dtype=int)
+        full_time_norm  = norm_time[indices_anim]   # shape (T_anim, 1)
+        full_state_norm = norm_state[indices_anim]  # shape (T_anim, 3)
+
+        # 4) Denormalize times for actual 0..100 s
+        #    If you kept 'states' in standard scale, also unscale them here if desired:
+        full_time_denorm = self.inverse_time_norm(full_time_norm)
+        full_state_denorm = self.scaler_state.inverse_transform(full_state_norm)  # if your states are scaled
+
         self.animation_data = {
-            'context_norm': context_norm,         # remains normalized, for model input
-            'full_time_norm': full_time_norm,       # normalized full time (now with 0.1 s resolution)
-            'full_state_norm': full_state_norm,     # normalized full state (if needed)
-            'full_time': full_time_denorm,          # denormalized full time for animation
-            'full_state': full_state_denorm         # denormalized full state for ground truth animation
+            'context_norm':      context_norm,       # normalized context => shape (context_tokens,4)
+            'full_time_norm':    full_time_norm,     # (T_anim,1) in [0..1]
+            'full_state_norm':   full_state_norm,    # (T_anim,3), normalized
+            'full_time':         full_time_denorm,   # real times (T_anim,1)
+            'full_state':        full_state_denorm   # real states (T_anim,3) if using scaler_state
         }
-        print("Animation data prepared.")
+        print("Animation data prepared: integer steps for context & downsampled full trajectory.")
+
+    def inverse_time_norm(self, t_norm):
+        """
+        Convert normalized time t_norm back to real time 
+        using min-max scaling with self.t_min, self.t_max.
+        """
+        return t_norm * (self.t_max - self.t_min) + self.t_min
+
 
 """
     def prepare_data_for_animation(self, zone=99, idx=0):

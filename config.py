@@ -22,7 +22,7 @@ SEED_RAND = 5
 SEED_SHUFFLE = 6
 SEED_TORCH = 7
 TEST_DATA_PROPORTION = 0.2
-BATCH_SIZE = 16
+BATCH_SIZE = 32
 #more than one if non trivial computation in getitem
 NUM_WORKERS = 1 #more than 1 = slower wtf => keep low for low data
 PHYSNET_HIDDEN = 64

@@ -244,29 +244,29 @@ def extract_param(model_name):
 
 def animate_trajectory(traj_data, title, save_path, interval=50, fps=None):
     """
-    Creates and saves a simple 3D animation (GIF) of a trajectory using FuncAnimation.
+    Creates and saves a simple 3D animation (GIF or MP4) of a trajectory using matplotlib.animation.FuncAnimation.
 
     Parameters:
       - traj_data: numpy array of shape (T, 3) for (x, y, z) over time.
+                   This should be *denormalized* if you want real-scale plotting.
       - title:     Title for the plot.
       - save_path: Path to save the animation (e.g., "my_anim.gif" or "my_anim.mp4").
       - interval:  Delay between frames in milliseconds (for display; does not affect final FPS).
       - fps:       Frames per second when saving. If None, will use 1000 / interval.
 
-    Note: If you give save_path a '.mp4' extension, Matplotlib will attempt to use
-    ffmpeg or another writer to create an MP4. For a GIF, use '.gif'.
+    Notes:
+      - If save_path ends with ".gif", it uses Pillow.
+      - If save_path ends with ".mp4", it attempts to use ffmpeg or another writer.
     """
-
     # If user did not specify fps, derive from interval (ms):
     if fps is None:
         fps = 1000.0 / interval
 
-    # Create the figure and a 3D axis
     fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
     ax.set_title(title)
 
-    # Set up axis limits based on trajectory extents
+    # Determine axis limits
     x_min, x_max = traj_data[:, 0].min(), traj_data[:, 0].max()
     y_min, y_max = traj_data[:, 1].min(), traj_data[:, 1].max()
     z_min, z_max = traj_data[:, 2].min(), traj_data[:, 2].max()
@@ -275,37 +275,39 @@ def animate_trajectory(traj_data, title, save_path, interval=50, fps=None):
     ax.set_ylim(y_min, y_max)
     ax.set_zlim(z_min, z_max)
 
-    # Plot object that we will update. Here, a single 3D line.
+    # A single 3D line to update
     line, = ax.plot([], [], [], lw=2, c='blue')
 
-    # Initialization function: called once before animation starts
     def init():
         line.set_data([], [])
         line.set_3d_properties([])
-        return (line,)
+        return line,
 
-    # Update function: called for each frame
     def update(frame):
-        # `frame` goes from 0 up to len(traj_data)-1
+        # frames go from 0..(T-1)
         x, y, z = traj_data[:frame+1, 0], traj_data[:frame+1, 1], traj_data[:frame+1, 2]
         line.set_data(x, y)
         line.set_3d_properties(z)
-        return (line,)
+        return line,
 
-    # Create the animation
     ani = FuncAnimation(
-        fig,
-        func=update,        # what to do each frame
-        frames=len(traj_data), 
-        init_func=init,     # initialization
-        interval=interval,  # ms delay between frames
+        fig, update,
+        frames=len(traj_data),
+        init_func=init,
+        interval=interval,
         blit=True
     )
 
-    # Save the animation
+    # Save
+    writer = None
+    if save_path.endswith('.gif'):
+        writer = 'pillow'
+    ani.save(save_path, fps=fps, writer=writer)
+    """OR# Save the animation
     # If save_path ends with .gif, it uses pillow by default.
     # If it ends with .mp4, it will try ffmpeg or the configured writer.
     ani.save(save_path, fps=fps, writer='pillow' if save_path.endswith('.gif') else None)
+    """
     plt.close(fig)
     print(f"Animation saved to {save_path}")
 
@@ -331,67 +333,69 @@ def load_model(model, model_name, device):
     return model
 
 
-def make_animation(model_name, device, zone=99, traj_idx=0, interval=50):
-    """
-    Creates two animations:
-      - Predicted trajectory: loads a saved model, runs predictions using the normalized context and full_time,
-        denormalizes the predictions, and saves a GIF.
-      - Ground truth trajectory: uses the denormalized full trajectory from the animation data.
-      
-    Both animations are automatically saved in the directory specified by API.config.FIG_DIR.
-    
-    Parameters:
-      - model_name: the saved model name (matching the format from get_name()).
-      - device: torch.device (e.g., torch.device("mps") or torch.device("cpu")).
-      - zone: the zone number to select the trajectory.
-      - traj_idx: index of the trajectory within that zone.
-      - interval: frame interval (ms) for the animation.
-    """
-    # Extract model parameters from model_name.
+def make_animation(model_name, device, zone=99, traj_idx=0, interval=50, ground_truth=True):
+
+
+    # 1) Parse model name => hyperparameters
     seq_len, embed_dim, num_layers, num_heads, num_tokens, resolution, context_fraction, load_size = extract_param(model_name)
-    
-    # Instantiate the database in animation mode.
-    db = API.DataBase(context_fraction=context_fraction, context_tokens=seq_len,
-                      load_size=load_size, resolution=resolution, animation=True)
-    # Prepare animation data for the specified trajectory.
+
+    # 2) Create the DB in animation mode and prepare the specific trajectory
+    db = API.DataBase(
+        context_fraction=context_fraction,
+        context_tokens=seq_len,
+        load_size=load_size,
+        resolution=resolution,
+        animation=True
+    )
     db.prepare_data_for_animation(zone=zone, idx=traj_idx)
-    anim_data = db.animation_data
-    
-    # Automatically construct save paths in FIG_DIR.
+    anim_data = db.animation_data  # dictionary with 'context_norm', 'full_time_norm', 'full_state', etc.
+
+    # 3) Create output paths
     fig_dir = Path(API.config.FIG_DIR)
     fig_dir.mkdir(parents=True, exist_ok=True)
-    save_path_pred = str(fig_dir / (model_name + "_prediction.gif"))
-    save_path_gt = str(fig_dir / (model_name + "_ground_truth.gif"))
-    
-    gt_full_state = anim_data["full_state"]
-    animate_trajectory(gt_full_state, title=f"Ground Truth Trajectory (Zone {zone})", save_path=save_path_gt, interval=interval)
+    save_path_gt   = str(fig_dir / f"{model_name}_ground_truth.gif")
+    save_path_pred = str(fig_dir / f"{model_name}_prediction.gif")
 
+    # 4) Animate ground truth
+    # anim_data["full_state"] is the real (unscaled) states => shape (T_anim,3).
+    if ground_truth:
+        gt_full_state = anim_data["full_state"]  # denormalized
+        animate_trajectory(gt_full_state,
+                        title=f"Ground Truth Trajectory (Zone={zone}, idx={traj_idx})",
+                        save_path=save_path_gt,
+                        interval=interval)
 
-    # Instantiate a new HybridNet with matching configuration.
-    model = API.HybridNet(seq_len=seq_len, input_dim=4, embed_dim=embed_dim,
-                          num_layers=num_layers, num_heads=num_heads,
-                          physnet_hidden=API.config.PHYSNET_HIDDEN, num_tokens=num_tokens)
-    # Load model weights.
+    # 5) Load model (HybridNet) with matching dimensions
+    model = API.HybridNet(
+        seq_len=seq_len,
+        input_dim=4,
+        embed_dim=embed_dim,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        physnet_hidden=API.config.PHYSNET_HIDDEN,
+        num_tokens=num_tokens
+    )
     model = load_model(model, model_name, device)
 
-    # Get normalized context and full_time_norm for prediction.
-    context = torch.tensor(anim_data["context_norm"], dtype=torch.float32, device=device).unsqueeze(0)  # (1, context_tokens, 4)
-    full_time_norm = torch.tensor(anim_data["full_time_norm"], dtype=torch.float32, device=device).unsqueeze(0)  # (1, T_anim, 1)
+    # 6) Predict
+    # context_norm => (context_tokens, 4)
+    # full_time_norm => (T_anim, 1)
+    context_norm   = torch.tensor(anim_data["context_norm"], dtype=torch.float32, device=device).unsqueeze(0)
+    full_time_norm = torch.tensor(anim_data["full_time_norm"], dtype=torch.float32, device=device).unsqueeze(0)
 
-    # Generate dynamic parameters from context.
-    params = model.hypernet(context)
+    params = model.hypernet(context_norm)
+    pred_full_norm = model.physnet(full_time_norm, params)  # shape (1, T_anim, 3)
+    pred_full_norm = pred_full_norm.squeeze(0).detach().cpu().numpy()  # shape (T_anim, 3)
 
-    # Instead of the while-loop:
-    pred_full_norm = model.physnet(full_time_norm, params)  # shape (1, T_anim, 3) or (1, 1000, 3)
-    if pred_full_norm.dim() == 2:
-        pred_full_norm = pred_full_norm.unsqueeze(1)
-
-    pred_full_norm = pred_full_norm.squeeze(0).detach().cpu().numpy()  # (T_anim, 3)
+    # 7) Denormalize predicted states
     pred_full = db.scaler_state.inverse_transform(pred_full_norm)
 
-    animate_trajectory(pred_full, title=f"Predicted Trajectory (Zone {zone})", save_path=save_path_pred, interval=interval)
-    
-    
+    # 8) Animate predicted
+    animate_trajectory(pred_full,
+                    title=f"Predicted Trajectory (Zone={zone}, idx={traj_idx})",
+                    save_path=save_path_pred,
+                    interval=interval)
+
     
     
     

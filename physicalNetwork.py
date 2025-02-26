@@ -14,7 +14,7 @@ class HybridNet(nn.Module):
     def __init__(
             self, seq_len=1000, input_dim=4, 
             embed_dim=128, num_layers=2, num_heads=4, 
-            physnet_hidden=64, num_tokens=1
+            physnet_hidden=64, num_tokens=1, attention_learn=False
         ):
         super(HybridNet, self).__init__()
         #create a Hypernetwork (transformers)
@@ -24,7 +24,8 @@ class HybridNet(nn.Module):
                                  num_layers=num_layers,
                                  num_heads=num_heads,
                                  physnet_hidden=physnet_hidden,
-                                 num_tokens=num_tokens)  # pass num_tokens if you decide to use more
+                                 num_tokens=num_tokens,
+                                 attention_learn=attention_learn)  # pass num_tokens if you decide to use more
         #create a Physical Network (simple perceptron layers)
         self.physnet = PhysNet(physnet_hidden=physnet_hidden)
         print("HybridNet initialized")
@@ -56,7 +57,7 @@ class HyperNet(nn.Module):
     """
     def __init__(
             self, seq_len=1000, input_dim=4, embed_dim=128, num_layers=2,
-            num_heads=4, physnet_hidden=64, num_tokens=1
+            num_heads=4, physnet_hidden=64, num_tokens=1, attention_learn=False
         ):
         super(HyperNet, self).__init__()
         self.seq_len = seq_len #nb of tokens, context
@@ -80,6 +81,10 @@ class HyperNet(nn.Module):
         self.num_tokens = num_tokens  # define the number of tokens as a hyperparameter
         self.cls_tokens = nn.Parameter(torch.randn(1, self.num_tokens, embed_dim))
         
+        if attention_learn:
+            self.attn_layer = nn.Linear(embed_dim, 1)
+        else: self.attn_layer = None
+
         # --- Transformer Encoder ---
         # We use a standard TransformerEncoder (with a few layers of multi‑head self-attention,
         # feed‑forward, normalization, and residual connections).
@@ -170,8 +175,20 @@ class HyperNet(nn.Module):
         transformer_out = transformer_out.transpose(0, 1)  # shape: (B, num_tokens+L, embed_dim)
         # Extract the learnable tokens (the first self.num_tokens tokens)
         token_out = transformer_out[:, :self.num_tokens, :]  # shape: (B, num_tokens, embed_dim)
-        # Aggregate the tokens to form a summary representation (e.g., by mean pooling)
-        summary = token_out.mean(dim=1)  # (B, embed_dim)
+        if self.attn_layer == None:
+            summary = token_out.mean(dim=1)  # (B, embed_dim)
+        else:
+            # Aggregate the tokens to form a summary representation (e.g., by mean pooling)
+            # Extract only the learnable tokens
+            
+            # --- Attention Pooling ---
+            # Compute attention scores for each token
+            attn_scores = self.attn_layer(token_out)  # (B, num_tokens, 1)
+            attn_weights = torch.softmax(attn_scores, dim=1)  # (B, num_tokens, 1)
+            # Weighted sum to get the aggregated summary
+            summary = (token_out * attn_weights).sum(dim=1)  # (B, embed_dim)
+        
+        
                 
         # --- Generate physics network parameters from the summary ---
         params = {} #keys : 'l1_weight' , 'l1_bias' ect
@@ -227,7 +244,11 @@ class PhysNet(nn.Module):
         self.norm2 = nn.LayerNorm(physnet_hidden)
         self.norm3 = nn.LayerNorm(physnet_hidden)
         self.norm4 = nn.LayerNorm(physnet_hidden)
-    
+        self.parameters = None
+
+    def set_parameters(self, parameters):
+        self.parameters = parameters
+
     def forward(self, t, params):
         # Layer 1: (1 -> physnet_hidden)
         x = API.tools.batched_linear(t, params['l1_weight'], params['l1_bias'])
@@ -258,7 +279,7 @@ class Coach:
     Trainer class for joint training of the hypernetwork (which generates the physics network parameters)
     and the physics network itself, with evaluation on test data to monitor overfitting.
     """
-    def __init__( self, model, dataBase, device, resolution=2, lr=1e-3):
+    def __init__( self, model, dataBase, device, resolution=2, lr=1e-3, pde_weight=0.1):
         """
         Parameters:
           - model: An instance of DeepPhysiNet.
@@ -270,13 +291,20 @@ class Coach:
           - device: Torch device ('cuda' or 'cpu').
         """
         self.model = model
-        self.loss_fn = API.HybridLoss(scaler_y=None)
         self.optimizer = optim.Adam(model.parameters(), lr=lr)
         self.device = device
         self.dataBase = dataBase
         self.t_min = dataBase.t_min
         self.t_max = dataBase.t_max
+        self.scaler_state = dataBase.scaler_state
         self.resolution = resolution
+        #hybridloss to device ?
+        self.loss_fn = API.HybridLoss(
+            t_min=self.t_min,t_max=self.t_max, 
+            scaler_state=self.scaler_state,
+            pde_weight=pde_weight
+        ).to(self.device)
+        #should .to_device(devide) this ?
         self.train_loader = self.dataBase.get_train_loader(shuffle=True)
         self.test_within_loader = self.dataBase.get_test_within_loader(shuffle=False)
         self.test_unseen_loader = self.dataBase.get_test_unseen_loader(shuffle=False)
@@ -286,7 +314,6 @@ class Coach:
         log_dir = Path(API.config.LOGS_DIR) / "tensorboard" / self.get_name()
         log_dir.mkdir(parents=True, exist_ok=True)  # create directory if it doesn't exist
         self.writer = SummaryWriter(log_dir=str(log_dir))
-
 
     def evaluate(self, loader, high_res_eval=False):
         #set to false for training , not testing mode
@@ -307,12 +334,24 @@ class Coach:
                     full_state = batch['full_state'].to(self.device)    # (B, high_res_length, 3)
                     pred_full = self.model.physnet(full_time, params)
                     # Here we skip PDE loss.
-                    loss, _, _ = self.loss_fn(full_time, pred_full, full_state, compute_data_loss=True, skip_pde=True)
+                    loss, _, _ = self.loss_fn(
+                        t_norm=full_time,
+                        space_pred_scaled=pred_full,
+                        space_true=full_state,
+                        compute_data_loss=True, 
+                        skip_pde=True
+                    )
                 else:
                     grid_time = batch['grid_time'].to(self.device)      # (B, context_tokens, 1)
                     grid_state = batch['grid_state'].to(self.device)    # (B, context_tokens, 3)
                     pred = self.model.physnet(grid_time, params)
-                    loss, _, _ = self.loss_fn(grid_time, pred, grid_state, compute_data_loss=True, skip_pde=True)
+                    loss, _, _ = self.loss_fn(
+                        t_norm=grid_time,
+                        space_pred_scaled=pred,
+                        space_true=grid_state,
+                        compute_data_loss=True,
+                        skip_pde=True
+                    )
                         
                 total_loss += loss.item()
         avg_loss = total_loss / len(loader)
@@ -332,27 +371,41 @@ class Coach:
                 # Retrieve precomputed splits.
                 context   = batch['context'].to(self.device)      # (B, context_tokens, 4)
                 grid_time = batch['grid_time'].to(self.device)      # (B, context_tokens, 1)
-                grid_state= batch['grid_state'].to(self.device)     # (B, context_tokens, 3)
-                inner_time= batch['inner_time'].to(self.device)      # (B, inner_count, 1)
-                
+                #grid_state= batch['grid_state'].to(self.device)     # (B, context_tokens, 3)
+                inner_time = batch['inner_time'].to(self.device)      # (B, inner_count, 1)
+                #denorm_grid_time = batch['denorm_grid_time'].to(self.device)      # (B, context_tokens, 1)
+                grid_state = batch['grid_state'].to(self.device)     # (B, context_tokens, 3)
+                #denorm_inner_time= batch['denorm_inner_time'].to(self.device)      # (B, inner_count, 1)
 
-                grid_time_real  = self.inverse_time_norm(grid_time)
-                inner_time_real = self.inverse_time_norm(inner_time)
+
 
                 # 3) We need gradients on the *real* times for PDE
-                grid_time_real.requires_grad_()
-                inner_time_real.requires_grad_()
+                #not grid_time = grid_time.require_grad() ?
+                grid_time.requires_grad_()
+                inner_time.requires_grad_()
                     # Generate dynamic parameters from context.
 
                 params = self.model.hypernet(context)
-                    
+                
                 # Predictions.
                 pred_grid  = self.model.physnet(grid_time, params)   # (B, context_tokens, 3)
                 pred_inner = self.model.physnet(inner_time, params)   # (B, inner_count, 3)
                 
-                # Compute losses.
-                loss_grid, data_loss, pde_loss_grid = self.loss_fn(grid_time_real, pred_grid, grid_state, compute_data_loss=True)
-                loss_inner, _, pde_loss_inner = self.loss_fn(inner_time_real, pred_inner, None, compute_data_loss=False)
+                # Compute losses., denormtime useless here
+                #donc c'est que de ici que normalisation de x y z depend ?
+                loss_grid, data_loss, pde_loss_grid = self.loss_fn(
+                    t_norm=grid_time, 
+                    space_pred_scaled=pred_grid, 
+                    space_true=grid_state, 
+                    compute_data_loss=True
+                )
+                #only pde so need denorm time for pde
+                loss_inner, _, pde_loss_inner = self.loss_fn(
+                    t_norm=inner_time, 
+                    space_pred_scaled=pred_inner, 
+                    space_true=None, 
+                    compute_data_loss=False
+                )
 
                 total_loss = loss_grid + loss_inner
                 total_loss.backward()
@@ -362,8 +415,14 @@ class Coach:
                 epoch_loss += total_loss.item()
             
             avg_train_loss = epoch_loss / len(self.train_loader)
-            test_within_loss = self.evaluate(self.test_within_loader)
-            test_unseen_loss = self.evaluate(self.test_unseen_loader)
+            test_within_loss = self.evaluate(
+                self.test_within_loader,
+                high_res_eval=True
+            )
+            test_unseen_loss = self.evaluate(
+                self.test_unseen_loader, 
+                high_res_eval=True
+            )
             
             self.writer.add_scalar('Loss/Train', avg_train_loss, epoch)
             self.writer.add_scalar('Loss/Test_Within', test_within_loss, epoch)
@@ -414,74 +473,131 @@ class Coach:
         plt.show()
 
 class HybridLoss(nn.Module):
-    def __init__(self, sigma=10.0, rho=28.0, beta=8.0/3.0):
+    def __init__(
+            self, 
+            sigma=10.0, rho=28.0, beta=8.0/3.0,
+            t_min=0.0, t_max=100.0,
+            scaler_state=None,
+            pde_weight=0.1
+    ):
+        """
+        scaler_state: your fitted StandardScaler for (x,y,z).
+                      We'll use scaler_state.mean_ and scaler_state.scale_
+                      to un-scale PDE derivatives.
+        """
         super(HybridLoss, self).__init__()
         self.mse_loss = nn.MSELoss()
         self.sigma = sigma
         self.rho = rho
         self.beta = beta
+        #keep in cpu bc onlu for small float
+        self.t_min = t_min
+        self.t_max = t_max
+        self.pde_weight = pde_weight
+        
+        self.scaler_state = scaler_state  # pass the same scaler used in DataBase
+        if self.scaler_state is not None:
+            # We'll store them as torch tensors in forward(...) to match device
+            self.mean_ = None
+            self.scale_ = None
 
-    def forward(self, t, space_pred, space_true=None, compute_data_loss=True, skip_pde=False):
-        # Compute data loss only if requested and if ground truth is provided.
+    def forward(self, t_norm, space_pred_scaled, space_true=None,
+                compute_data_loss=True, skip_pde=False):
+        """
+        t_norm: shape (B, T, 1) in [0..1].
+        space_pred_scaled: shape (B, T, 3), net output in scaled domain if scaler is used.
+        space_true: shape (B, T, 3) => can be scaled or unscaled, your choice.
+        skip_pde: if True, skip PDE constraints.
+
+        We'll do chain rule for both time & state, to get real derivatives from scaled outputs.
+        """
+        #should not space.requires_grad before ?
         if compute_data_loss and space_true is not None:
-            data_loss = self.mse_loss(space_pred, space_true)
+            data_loss = self.mse_loss(space_pred_scaled, space_true)
         else:
             data_loss = 0.0
 
-        # If we want to skip the PDE loss (e.g. during evaluation), return only the data loss.
+        # 2) If skip_pde => just return data_loss
         if skip_pde:
             return data_loss, data_loss, 0.0
 
-        # Otherwise, compute the PDE loss.
-        # Ensure space_pred requires gradient
-        space_pred = space_pred.requires_grad_(True)
+        # 3) PDE chain rule for time
+        chain_factor_time = 1.0 / (self.t_max - self.t_min)
+
+        # 4) Enable gradient on space_pred_scaled wrt t_norm
+        space_pred_scaled.requires_grad_(True)
+        #or not the = ? 
+        # For each dimension x,y,z => d(...) / d(t_norm)
+        dx_dtau = torch.autograd.grad(
+            outputs=space_pred_scaled[..., 0],  # x_scaled
+            inputs=t_norm,
+            grad_outputs=torch.ones_like(space_pred_scaled[..., 0]),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+
+        dy_dtau = torch.autograd.grad(
+            outputs=space_pred_scaled[..., 1],  # y_scaled
+            inputs=t_norm,
+            grad_outputs=torch.ones_like(space_pred_scaled[..., 1]),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+
+        dz_dtau = torch.autograd.grad(
+            outputs=space_pred_scaled[..., 2],  # z_scaled
+            inputs=t_norm,
+            grad_outputs=torch.ones_like(space_pred_scaled[..., 2]),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+
+        # Squeeze final dim if shape is (B,T,1)
+        dx_dtau = dx_dtau.squeeze(-1)
+        dy_dtau = dy_dtau.squeeze(-1)
+        dz_dtau = dz_dtau.squeeze(-1)
+
+        # 5) Also chain rule for state scaling
+        # We'll get scale_x, scale_y, scale_z from self.scaler_state
+        if self.mean_ is None or self.scale_ is None:
+            # create them as torch tensors on correct device
+            self.mean_ = torch.tensor(self.scaler_state.mean_, dtype=torch.float32,
+                                      device=t_norm.device).view(1,1,3)
+            self.scale_ = torch.tensor(self.scaler_state.scale_, dtype=torch.float32,
+                                       device=t_norm.device).view(1,1,3)
         
-        # Compute each derivative separately.
-        dxdt_pred = torch.autograd.grad(
-            outputs=space_pred[..., 0],  # x component
-            inputs=t,
-            grad_outputs=torch.ones_like(space_pred[..., 0]),
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True
-        )[0]
-        dydt_pred = torch.autograd.grad(
-            outputs=space_pred[..., 1],  # y component
-            inputs=t,
-            grad_outputs=torch.ones_like(space_pred[..., 1]),
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True
-        )[0]
-        dzdt_pred = torch.autograd.grad(
-            outputs=space_pred[..., 2],  # z component
-            inputs=t,
-            grad_outputs=torch.ones_like(space_pred[..., 2]),
-            create_graph=True,
-            retain_graph=True,# for the last one retain_graph=True,
-            only_inputs=True
-        )[0]
+        # scale_ => shape (1,1,3). We'll do dimension wise multiplication
 
-        # Squeeze the last dimension if necessary
-        dxdt_pred = dxdt_pred.squeeze(-1)
-        dydt_pred = dydt_pred.squeeze(-1)
-        dzdt_pred = dzdt_pred.squeeze(-1)
+        # dx_dtau (B,T), but we want to multiply by scale_ for x => scale_[...,0], etc.
+        # Let's just gather them carefully. We can do this by indexing or by a gather approach.
 
-        # Extract predictions.
-        x_pred = space_pred[..., 0]
-        y_pred = space_pred[..., 1]
-        z_pred = space_pred[..., 2]
+        # dxdt_pred_real = dx_dtau_scaled * scale_x * chain_factor_time
+        dxdt_pred_real = dx_dtau * self.scale_[...,0] * chain_factor_time
+        dydt_pred_real = dy_dtau * self.scale_[...,1] * chain_factor_time
+        dzdt_pred_real = dz_dtau * self.scale_[...,2] * chain_factor_time
 
-        # Define Lorenz ODEs.
-        dxdt_lorenz = self.sigma * (y_pred - x_pred)
-        dydt_lorenz = x_pred * (self.rho - z_pred) - y_pred
-        dzdt_lorenz = x_pred * y_pred - self.beta * z_pred
+        # 6) Now convert scaled states => real
+        x_scaled = space_pred_scaled[...,0]
+        y_scaled = space_pred_scaled[...,1]
+        z_scaled = space_pred_scaled[...,2]
+        # x_real = x_scaled * scale_x + mean_x
+        x_real = x_scaled * self.scale_[...,0] + self.mean_[...,0]
+        y_real = y_scaled * self.scale_[...,1] + self.mean_[...,1]
+        z_real = z_scaled * self.scale_[...,2] + self.mean_[...,2]
 
-        # Compute physics loss for each coordinate.
-        physics_loss_x = self.mse_loss(dxdt_pred, dxdt_lorenz)
-        physics_loss_y = self.mse_loss(dydt_pred, dydt_lorenz)
-        physics_loss_z = self.mse_loss(dzdt_pred, dzdt_lorenz)
+        # 7) PDE in real scale
+        dxdt_lorenz = self.sigma * (y_real - x_real)
+        dydt_lorenz = x_real * (self.rho - z_real) - y_real
+        dzdt_lorenz = x_real * y_real - self.beta * z_real
+
+        # 8) PDE MSE
+        physics_loss_x = self.mse_loss(dxdt_pred_real, dxdt_lorenz)
+        physics_loss_y = self.mse_loss(dydt_pred_real, dydt_lorenz)
+        physics_loss_z = self.mse_loss(dzdt_pred_real, dzdt_lorenz)
         physics_loss = physics_loss_x + physics_loss_y + physics_loss_z
 
-        total_loss = data_loss + physics_loss
+        total_loss = data_loss + self.pde_weight*physics_loss
         return total_loss, data_loss, physics_loss
