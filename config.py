@@ -25,5 +25,7 @@ TEST_DATA_PROPORTION = 0.2
 BATCH_SIZE = 32
 #more than one if non trivial computation in getitem
 NUM_WORKERS = 1 #more than 1 = slower wtf => keep low for low data
-PHYSNET_HIDDEN = 64
+PHYSNET_HIDDEN = 32
+
+M = 10e4
 

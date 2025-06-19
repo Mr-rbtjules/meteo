@@ -599,5 +599,6 @@ class HybridLoss(nn.Module):
         physics_loss_z = self.mse_loss(dzdt_pred_real, dzdt_lorenz)
         physics_loss = physics_loss_x + physics_loss_y + physics_loss_z
 
-        total_loss = data_loss + self.pde_weight*physics_loss
+        total_loss = API.config.M*data_loss + self.pde_weight*physics_loss
+        #ajouter un loss spécifique pour la condition initiale ???
         return total_loss, data_loss, physics_loss
