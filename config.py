@@ -29,3 +29,17 @@ PHYSNET_HIDDEN = 32
 
 M = 10e4
 
+# Lorenz-96 Parameters
+N_LORENZ = 10 # Total number of system variables
+F_LORENZ = 8 # Forcing parameter
+DT_LORENZ = 0.01 # Time step for simulation
+NUM_STEPS_LORENZ = 20000 # Number of timesteps for the simulated trajectory
+NX_LORENZ = 5 # Number of observed variables
+
+# Transformer Parameters
+SEQUENCE_LENGTH = 10 # Length of input sequence for Transformer
+NUM_LAYERS = 2 # Number of Transformer decoder layers
+NUM_HEADS = 4 # Number of attention heads
+EMBEDDING_DIM = 64 # Dimension of the embedding space
+ALPHA_PI = 1e-3 # Weight for physics-informed loss
+SEGMENT_LENGTH = 200 # Length of trajectory segments for batching
