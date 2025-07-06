@@ -11,6 +11,7 @@ LOGS_DIR = os.path.join(BASE_DIR, "./data/logs")
 MODELS_DIR = os.path.join(BASE_DIR, "./data/saved_models")
 RAW_DATA_DIR = os.path.join(BASE_DIR, "./data/lorenzData")
 FIG_DIR = os.path.join(BASE_DIR, "./data/figures")
+MODEL_SAVE_DIR = os.path.join(BASE_DIR, "./data/saved_models") # Directory to save trained models
 
 
 
@@ -22,10 +23,10 @@ SEED_RAND = 5
 SEED_SHUFFLE = 6
 SEED_TORCH = 7
 TEST_DATA_PROPORTION = 0.2
-BATCH_SIZE = 32
+BATCH_SIZE = 64 # Batch size for training and validation
 #more than one if non trivial computation in getitem
-NUM_WORKERS = 1 #more than 1 = slower wtf => keep low for low data
-PHYSNET_HIDDEN = 32
+NUM_WORKERS = 1
+
 
 M = 10e4
 
@@ -36,10 +37,13 @@ DT_LORENZ = 0.01 # Time step for simulation
 NUM_STEPS_LORENZ = 20000 # Number of timesteps for the simulated trajectory
 NX_LORENZ = 5 # Number of observed variables
 
-# Transformer Parameters
-SEQUENCE_LENGTH = 10 # Length of input sequence for Transformer
-NUM_LAYERS = 2 # Number of Transformer decoder layers
-NUM_HEADS = 4 # Number of attention heads
-EMBEDDING_DIM = 64 # Dimension of the embedding space
-ALPHA_PI = 1e-3 # Weight for physics-informed loss
-SEGMENT_LENGTH = 200 # Length of trajectory segments for batching
+# LSTM Parameters
+LSTM_HIDDEN_SIZE = 100
+LSTM_NUM_LAYERS = 1
+LSTM_DROPOUT_RATE = 0.0 # Set dropout to 0 for single-layer LSTM to avoid warning
+
+ALPHA_PI = 1e-2 # Weight for physics-informed loss
+SEGMENT_LENGTH = 200 # Length of trajectory segments for batching = number of sliding windows returned by getitem
+
+# Global Model Configuration
+MODEL_TYPE = 'PILSTM' # 'Transformer' or 'PILSTM'

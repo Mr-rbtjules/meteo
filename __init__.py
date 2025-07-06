@@ -1,6 +1,6 @@
 from . import tools
 from . import config
 
-from .hybridNet import HybridNet, Coach, HybridLoss
+from .hybridNet import Coach, HybridLoss, PILSTMNet
 
-from .dataBase import DataBase, TrajectoryDataset
+from .dataBase import DataBase, LSTMTrajectoryDataset

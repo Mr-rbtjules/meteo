@@ -12,18 +12,17 @@ import meteo_api as API
 
 
 ###LORENZ SIMULATION###
-cache = False
-@njit(cache=cache)
 def lorenz_96_ode(x, F):
     """
-    Computes the right-hand side of the Lorenz-96 equations.
-    x: A numpy array of shape (N,) representing the current state.
+    Computes the right-hand side of the Lorenz-96 equations (vectorized).
+    x: A numpy array of shape (N,) or (batch_size, N) representing the current state.
     F: The forcing parameter.
     """
-    N = x.shape[0]
-    dxdt = np.zeros(N)
-    for i in range(N):
-        dxdt[i] = (x[(i - 1 + N) % N] - x[(i + 2) % N]) * x[(i + 1) % N] - x[i] + F
+    x_minus_1 = np.roll(x, 1, axis=-1) #y_{i-1} , use roll to handle periodic boundary conditions
+    x_plus_1 = np.roll(x, -1, axis=-1) #y_{i+1}
+    x_plus_2 = np.roll(x, -2, axis=-1) #y_{i+2}
+    
+    dxdt = (x_minus_1 - x_plus_2) * x_plus_1 - x + F
     return dxdt
 
 def simulate_lorenz_96(N, F, dt, num_steps, initial_state=None):
@@ -104,3 +103,63 @@ def plot_pdfs(ground_truth_trajectory, simulated_trajectory, N_variables, fig_di
         print(f"Saved PDF plot for y_{i} to {plot_filename}")
 
     print("All PDF plots generated.")
+
+
+def run_closed_loop_and_plot(model, data_base, device, initial_state, num_simulation_steps, fig_dir_suffix):
+    """
+    Runs a closed-loop simulation and plots the PDFs of the state variables.
+    """
+    # Create a temporary coach instance for inference
+    inference_coach = API.Coach(model, data_base, device)
+    
+    # Run closed-loop simulation
+    simulated_trajectory = inference_coach.predict_closed_loop(initial_state, num_simulation_steps)
+    print(f"Simulated trajectory shape: {simulated_trajectory.shape}")
+    print("Closed-loop simulation complete.")
+
+    # Plot PDFs
+    print(f"\nGenerating PDF plots for simulation '{fig_dir_suffix}'...")
+    plot_pdfs(
+        ground_truth_trajectory=data_base.raw_trajectory,
+        simulated_trajectory=simulated_trajectory,
+        N_variables=API.config.N_LORENZ,
+        fig_dir=Path(API.config.FIG_DIR) / fig_dir_suffix
+    )
+    print(f"PDF plots for simulation '{fig_dir_suffix}' generated and saved.")
+
+
+def load_or_train_model(data_base, device, num_epochs):
+    # Only PILSTMNet is supported
+    model_class = API.PILSTMNet
+    model_kwargs = {
+        'input_dim': API.config.NX_LORENZ,
+        'output_dim': API.config.N_LORENZ,
+        'hidden_size': API.config.LSTM_HIDDEN_SIZE,
+        'num_layers': API.config.LSTM_NUM_LAYERS
+    }
+
+    # Create a temporary model instance to get the model name for saving/loading paths
+    temp_model = model_class(**model_kwargs)
+    model_name = API.Coach(temp_model, data_base, device).get_name()
+    model_path = Path(API.config.MODEL_SAVE_DIR) / f"{model_name}_epoch_{num_epochs}.pth"
+    
+    if model_path.exists():
+        print(f"Loading model from {model_path}...")
+        model, optimizer, scaler = API.Coach.load_model(model_class, model_path, device)
+        # Update data_base's scaler with the loaded one
+        data_base.scaler = scaler 
+        print("Model loaded.")
+    else:
+        print("No saved model found. Starting training...")
+        model = model_class(**model_kwargs)
+        coach = API.Coach(
+            dataBase = data_base, 
+            device   = device,
+            model    = model
+        )
+        coach.train(num_epochs=num_epochs)
+        coach.save_model(num_epochs) # Save after training
+        model = coach.model # Get the trained model instance
+        scaler = data_base.scaler # Get the scaler from the data_base
+
+    return model, scaler # Return model and the scaler used for it

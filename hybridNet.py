@@ -1,4 +1,3 @@
-
 import meteo_api as API
 import matplotlib.pyplot as plt # type: ignore
 import math
@@ -7,132 +6,66 @@ import torch.nn as nn # type: ignore
 import torch.optim as optim # type: ignore
 import torch.nn.functional as F # type: ignore
 from pathlib import Path
-from torch.utils.data import DataLoader # Added import
+from torch.utils.data import Dataset, DataLoader # Added import
 import numpy as np # type: ignore
-
+import joblib # For saving/loading scaler
+from meteo_api.dataBase import OBS_IDXS
 from torch.utils.tensorboard import SummaryWriter # type: ignore
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        # x shape: (sequence_length, batch_size, embedding_dim)
-        return x + self.pe[:x.size(0), :]
-
-
-class HybridNet(nn.Module):
-    """
-    A Physics‑Informed Transformer model for autoregressive forecasting.
-
-    Default mode is an encoder‑only (GPT‑style) architecture with causal
-    masking.  Set ``use_kv_cache=True`` to enable an incremental KV‑cache
-    for faster closed‑loop inference.
-    """
-    def __init__(self, input_dim, output_dim, d_model, nhead, num_layers,
-                 dim_feedforward=2048, dropout=0.1, *, use_kv_cache: bool = False):
-        super(HybridNet, self).__init__()
-        self.use_kv_cache = use_kv_cache
-        self.kv_cache = None  # will hold past embeddings when KV‑cache is enabled
-        self.model_type = 'DecoderOnlyTransformer'
+class PILSTMNet(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_size, num_layers, dropout=API.config.LSTM_DROPOUT_RATE):
+        super(PILSTMNet, self).__init__()
+        self.model_type = 'PILSTM'
         self.input_dim = input_dim # NX_LORENZ
         self.output_dim = output_dim # N_LORENZ
-        self.d_model = d_model
-        self.nhead = nhead
+        self.hidden_size = hidden_size
         self.num_layers = num_layers
 
-        self.input_embedding = nn.Linear(input_dim, d_model)
-        self.pos_encoder = PositionalEncoding(d_model)
+        self.lstm = nn.LSTM(input_dim, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.output_linear = nn.Linear(hidden_size, output_dim)
 
-        # Causal Transformer Encoder (decoder‑only style)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model, nhead, dim_feedforward, dropout, batch_first=False
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
-
-        self.output_linear = nn.Linear(d_model, output_dim)
-
-    def forward(self, src, *, reset_cache: bool = False):
-        """
-        Args
-        ----
-        src : Tensor
-            Shape (batch_size, sequence_length, input_dim).
-        reset_cache : bool, optional
-            If True, forces the internal KV‑cache to be cleared
-            at the beginning of a new autoregressive rollout.
-        """
-        if reset_cache or not self.use_kv_cache or self.training:
-            self.kv_cache = None  # (re)start a fresh cache when training or if disabled
-
-        # --- (Optional) build / extend KV cache -------------------------------------
-        if self.use_kv_cache and not self.training:
-            # keep only the last token to append
-            last_token = src[:, -1:, :]  # (B, 1, input_dim)
-
-            if self.kv_cache is None:
-                working_src = last_token
-            else:
-                working_src = torch.cat([self.kv_cache, last_token], dim=1)
-
-            # store for next call
-            self.kv_cache = working_src
-        else:
-            working_src = src  # full context (training or cache disabled)
-
-        # ---------------------------------------------------------------------------
-        # Transformer expects (seq_len, batch, feat) when batch_first=False
-        working_src = working_src.permute(1, 0, 2)
-
-        # input projection + pos‑enc
-        emb = self.input_embedding(working_src) * math.sqrt(self.d_model)
-        emb = self.pos_encoder(emb)
-
-        # causal mask
-        seq_len = emb.size(0)
-        src_mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=emb.device)
-
-        # encoder pass
-        enc_out = self.transformer_encoder(emb, mask=src_mask)
-
-        # take the representation corresponding to the latest timestep
-        last_step_repr = enc_out[-1, :, :]          # (batch, d_model)
-        prediction = self.output_linear(last_step_repr)  # (batch, output_dim)
-        return prediction
+    def forward(self, src, hidden=None):
+        # src shape: (batch_size, sequence_length, input_dim)
+        
+        lstm_out, hidden = self.lstm(src, hidden)
+        
+        # Take the output from the last timestep of the LSTM
+        # For training, we need outputs for all timesteps in the sequence
+        # For inference, we only need the last one
+        # So, return full sequence output for training, and handle last step in Coach
+        
+        # If src is a sequence (batch_size, seq_len, input_dim), lstm_out is (batch_size, seq_len, hidden_size)
+        # We need to apply linear layer to each timestep's output
+        predictions_seq = self.output_linear(lstm_out) # Shape: (batch_size, sequence_length, N_LORENZ)
+        
+        return predictions_seq, hidden
 
 
 class Coach:
 
-    def __init__(self, dataBase, device, lr=1e-3):
+    def __init__(self, model, dataBase, device, lr=1e-3):
         self.device = device
         self.dataBase = dataBase
-        
-        # Initialize the Transformer model
-        self.model = HybridNet(
-            input_dim=API.config.NX_LORENZ,
-            output_dim=API.config.N_LORENZ,
-            d_model=API.config.EMBEDDING_DIM,
-            nhead=API.config.NUM_HEADS,
-            num_layers=API.config.NUM_LAYERS
-        ).to(self.device)
+        self.model = model.to(self.device)
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         
         self.loss_fn = API.HybridLoss().to(self.device)
+        # Set scaler parameters for HybridLoss after dataBase is initialized
+        self.loss_fn.set_scaler_params(self.dataBase.scaler.mean_, self.dataBase.scaler.scale_, self.device)
         
         log_dir = Path(API.config.LOGS_DIR) / "tensorboard" / self.get_name()
         log_dir.mkdir(parents=True, exist_ok=True)  # create directory if it doesn't exist
         self.writer = SummaryWriter(log_dir=str(log_dir))
 
-        self.train_dataset = API.DataBase.TrajectoryDataset(self.dataBase.reduced)
+        # Conditional dataset and dataloader initialization
+        if self.model.model_type == 'PILSTM':
+            self.train_dataset = API.LSTMTrajectoryDataset(self.dataBase.trajectory, self.dataBase.raw_trajectory, self.dataBase.train_lstm_segment_indices)
+            self.val_dataset = API.LSTMTrajectoryDataset(self.dataBase.trajectory, self.dataBase.raw_trajectory, self.dataBase.val_lstm_segment_indices)
+        else:
+            raise ValueError(f"Unknown model type: {self.model.model_type}")
+
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=API.config.BATCH_SIZE,
@@ -141,13 +74,19 @@ class Coach:
             worker_init_fn=API.dataBase.worker_init_fn # Ensure reproducibility
         )
 
+        self.val_loader = DataLoader(
+            self.val_dataset,
+            batch_size=API.config.BATCH_SIZE,
+            shuffle=False, # No need to shuffle validation data
+            num_workers=API.config.NUM_WORKERS,
+            worker_init_fn=API.dataBase.worker_init_fn
+        )
+
     def get_name(self):
         # Generate a unique name for TensorBoard logs based on model and hyperparameters
         return (
-            f"Transformer_N{API.config.N_LORENZ}_Nx{API.config.NX_LORENZ}_F{API.config.F_LORENZ}"
-            f"_dt{API.config.DT_LORENZ}_seq{API.config.SEQUENCE_LENGTH}"
-            f"_dmodel{API.config.EMBEDDING_DIM}_nhead{API.config.NUM_HEADS}"
-            f"_layers{API.config.NUM_LAYERS}_alphaPI{API.config.ALPHA_PI}"
+            f"LSTM_N{API.config.N_LORENZ}_Nx{API.config.NX_LORENZ}_F{API.config.F_LORENZ}"
+            f"_dt{API.config.DT_LORENZ}_hsize{API.config.LSTM_HIDDEN_SIZE}_layers{API.config.LSTM_NUM_LAYERS}_alphaPI{API.config.ALPHA_PI}"
         )
 
     def train(self, num_epochs=100):
@@ -157,29 +96,29 @@ class Coach:
             total_dd_loss_epoch = 0
             total_pi_loss_epoch = 0
             
-            for batch_idx, (segment_x_seqs, segment_y_nexts, segment_y_current_full_states) in enumerate(self.train_loader):
-                # segment_x_seqs: (batch_size, SEGMENT_LENGTH, SEQUENCE_LENGTH, NX_LORENZ)
-                # segment_y_nexts: (batch_size, SEGMENT_LENGTH, N_LORENZ)
-                # segment_y_current_full_states: (batch_size, SEGMENT_LENGTH, N_LORENZ)
+            for batch_idx, (x_segment, y_segment_targets, y_segment_current_full_states) in enumerate(self.train_loader):
+                # x_segment: (batch_size, SEGMENT_LENGTH, NX_LORENZ)
+                # y_segment_targets: (batch_size, SEGMENT_LENGTH, N_LORENZ)
+                # y_segment_current_full_states: (batch_size, SEGMENT_LENGTH, N_LORENZ)
 
-                # Reshape to (batch_size * SEGMENT_LENGTH, SEQUENCE_LENGTH, NX_LORENZ)
-                # and (batch_size * SEGMENT_LENGTH, N_LORENZ) for targets
-                batch_size, segment_length, seq_len, nx = segment_x_seqs.shape
-                _, _, n_lorenz = segment_y_nexts.shape
-
-                x_seq_flat = segment_x_seqs.view(-1, seq_len, nx).to(self.device)
-                y_next_flat = segment_y_nexts.view(-1, n_lorenz).to(self.device)
-                y_current_full_state_flat = segment_y_current_full_states.view(-1, n_lorenz).to(self.device)
+                x_segment = x_segment.to(self.device)
+                y_segment_targets = y_segment_targets.to(self.device)
+                y_segment_current_full_states = y_segment_current_full_states.to(self.device)
 
                 self.optimizer.zero_grad()
-                
-                # Forward pass for all sequences in the flattened batch
-                predictions_flat = self.model(x_seq_flat) # predictions_flat is ŷ(t+1) for each step in the segment
 
-                # Calculate loss for the entire flattened batch
-                total_loss, l_dd, l_pi = self.loss_fn(predictions_flat, y_next_flat, y_current_full_state_flat)
-                
-                # Backward pass and optimize
+                # Unroll LSTM over the segment
+                # predictions_seq will be (batch_size, SEGMENT_LENGTH, N_LORENZ)
+                predictions_seq, _ = self.model(x_segment) 
+
+                # Calculate loss for the entire sequence
+                total_loss, l_dd, l_pi = self.loss_fn(
+                    predictions_seq, 
+                    y_segment_targets, 
+                    y_segment_current_full_states, 
+                    self.dataBase.scaler
+                )
+
                 total_loss.backward()
                 self.optimizer.step()
 
@@ -198,73 +137,139 @@ class Coach:
             self.writer.add_scalar('Loss/DataDriven', avg_dd_loss, epoch)
             self.writer.add_scalar('Loss/PhysicsInformed', avg_pi_loss, epoch)
             
+            # --- Validation Loop ---
+            self.model.eval() # Set model to evaluation mode
+            val_total_loss_epoch = 0
+            val_dd_loss_epoch = 0
+            val_pi_loss_epoch = 0
+            with torch.no_grad():
+                for batch_idx_val, (x_segment_val, y_segment_targets_val, y_segment_current_full_states_val) in enumerate(self.val_loader):
+                    x_segment_val = x_segment_val.to(self.device)
+                    y_segment_targets_val = y_segment_targets_val.to(self.device)
+                    y_segment_current_full_states_val = y_segment_current_full_states_val.to(self.device)
+
+                    predictions_seq_val, _ = self.model(x_segment_val)
+
+                    val_total_loss, val_l_dd, val_l_pi = self.loss_fn(
+                        predictions_seq_val, 
+                        y_segment_targets_val, 
+                        y_segment_current_full_states_val, 
+                        self.dataBase.scaler
+                    )
+                    
+                    val_total_loss_epoch += val_total_loss.item()
+                    val_dd_loss_epoch += val_l_dd.item()
+                    val_pi_loss_epoch += val_l_pi.item()
+
+            avg_val_total_loss = val_total_loss_epoch / len(self.val_loader)
+            avg_val_dd_loss = val_dd_loss_epoch / len(self.val_loader)
+            avg_val_pi_loss = val_pi_loss_epoch / len(self.val_loader)
+
+            print(f"Epoch {epoch+1}/{num_epochs}, Validation Total Loss: {avg_val_total_loss:.6f}, "
+                  f"Val Data-driven Loss: {avg_val_dd_loss:.6f}, Val Physics-informed Loss: {avg_val_pi_loss:.6f}")
+            
+            self.writer.add_scalar('Loss/Validation/Total', avg_val_total_loss, epoch)
+            self.writer.add_scalar('Loss/Validation/DataDriven', avg_val_dd_loss, epoch)
+            self.writer.add_scalar('Loss/Validation/PhysicsInformed', avg_val_pi_loss, epoch)
+
+            self.model.train() # Set model back to training mode
+            # --- End Validation Loop ---
+            
         self.writer.close()
         print("Training complete.")
+        self.save_model(num_epochs) # Save model after final epoch
 
     def predict_closed_loop(self, initial_state, num_simulation_steps):
         self.model.eval() # Set model to evaluation mode
         with torch.no_grad():
-            # initial_state: numpy array (N_LORENZ,)
+            # initial_state: numpy array (N_LORENZ)
             # We need to normalize it first
             initial_state_normalized = self.dataBase.scaler.transform(initial_state.reshape(1, -1)).flatten()
             
-            # The first input to the Transformer is a sequence of observed variables.
-            # For closed-loop, we start with the initial state's observed variables,
-            # and for the preceding SEQUENCE_LENGTH-1 steps, we can use the initial state's observed variables
-            # or zeros, depending on how we want to "prime" the model.
-            # A simple approach is to repeat the initial observed state for the sequence length.
-            # Or, if we have a true initial sequence, we would use that.
-            # For now, let's assume we are given a single initial state y(t_0) and want to predict y(t_1), y(t_2), ...
-            # The model expects a sequence of length SEQUENCE_LENGTH.
-            # So, we'll create an initial input sequence by repeating the observed part of the initial state.
+            # Initialize the trajectory with the initial state as a tensor on the device
+            initial_state_tensor = torch.tensor(initial_state_normalized, dtype=torch.float32).to(self.device)
+            simulated_trajectory_tensors = [initial_state_tensor]
             
-            # This is a simplification. A more robust approach would be to provide a true initial sequence
-            # if available, or to use a warm-up period.
-            # For now, let's use the initial_state's observed part as the last element of the input sequence,
-            # and fill the rest with zeros or a sensible default.
-            # The paper says: "The Transformer predicts the next full state ỹ(t_1) from x(t_0).
-            # Then, it uses ỹ(t_1) as the input to predict ỹ(t_2), and so on."
-            # This implies the input is always just x(t).
-            # So, the input to the model is (batch_size, sequence_length, NX_LORENZ).
-            # For the first prediction, we need a sequence of x(t) up to t_0.
-            # Let's assume initial_state is y(t_0). We need x(t_0) as the last element of the input sequence.
-            # For simplicity, let's create an input sequence where all elements are x(t_0).
+            # For LSTM, we need to maintain hidden state
+            hidden = None
+            # The input sequence for LSTM is just the current observed state
+            current_lstm_input = initial_state_tensor[OBS_IDXS].unsqueeze(0).unsqueeze(0)
+            #current_lstm_input = initial_state_tensor[:API.config.NX_LORENZ].unsqueeze(0).unsqueeze(0) # (1, 1, NX_LORENZ)
             
-            # The model's forward method expects (batch_size, sequence_length, input_dim)
-            # The input_dim is NX_LORENZ.
-            
-            # Initialize the trajectory with the initial state
-            simulated_trajectory = [initial_state_normalized]
-            
-            # Create the initial input sequence for the Transformer
-            # This sequence will be updated iteratively
-            current_input_sequence = torch.zeros(API.config.SEQUENCE_LENGTH, API.config.NX_LORENZ, dtype=torch.float32).to(self.device)
-            
-            # Set the last element of the input sequence to the observed part of the initial state
-            current_input_sequence[-1, :] = torch.tensor(initial_state_normalized[:API.config.NX_LORENZ], dtype=torch.float32).to(self.device)
-
             for step in range(num_simulation_steps):
-                # Add batch dimension
-                input_batch = current_input_sequence.unsqueeze(0) # Shape: (1, SEQUENCE_LENGTH, NX_LORENZ)
+                # For LSTM, input is just the current observed state
+                # current_lstm_input shape: (1, 1, NX_LORENZ)
+                predicted_next_state_normalized, hidden = self.model(current_lstm_input, hidden) # LSTM returns (output, hidden)
+                predicted_next_state_normalized = predicted_next_state_normalized.squeeze(0).squeeze(0) # Shape: (N_LORENZ,)
                 
-                # Predict the next full state
-                predicted_next_state_normalized = self.model(input_batch).squeeze(0) # Shape: (N_LORENZ,)
+                # The next input for LSTM is the observed part of the current prediction
+                current_lstm_input = predicted_next_state_normalized[OBS_IDXS].unsqueeze(0).unsqueeze(0)
+
+                # Add the predicted state to the simulated trajectory (keep as tensor on device)
+                simulated_trajectory_tensors.append(predicted_next_state_normalized)
                 
-                # Add the predicted state to the simulated trajectory
-                simulated_trajectory.append(predicted_next_state_normalized.cpu().numpy())
-                
-                # Update the input sequence for the next prediction
-                # Shift the sequence and add the observed part of the new prediction
-                current_input_sequence = torch.roll(current_input_sequence, shifts=-1, dims=0)
-                current_input_sequence[-1, :] = predicted_next_state_normalized[:API.config.NX_LORENZ]
-                
-            # Convert list of numpy arrays to a single numpy array
-            simulated_trajectory_normalized = np.array(simulated_trajectory)
+            # Convert list of tensors to a single tensor
+            simulated_trajectory_normalized_tensor = torch.stack(simulated_trajectory_tensors) # Shape: (num_steps, N_LORENZ)
+            
+            # Move to CPU and convert to numpy for inverse_transform, only once at the end
+            simulated_trajectory_normalized_numpy = simulated_trajectory_normalized_tensor.cpu().numpy()
             
             # Inverse transform the normalized trajectory to get original scale
-            simulated_trajectory_original_scale = self.dataBase.scaler.inverse_transform(simulated_trajectory_normalized)
+            simulated_trajectory_original_scale = self.dataBase.scaler.inverse_transform(simulated_trajectory_normalized_numpy)
             
             return simulated_trajectory_original_scale
+
+    def save_model(self, epoch):
+        model_filename = f"{self.get_name()}_epoch_{epoch}.pth"
+        scaler_filename = f"{self.get_name()}_scaler.joblib"
+        
+        model_path = Path(API.config.MODEL_SAVE_DIR) / model_filename
+        scaler_path = Path(API.config.MODEL_SAVE_DIR) / scaler_filename
+        
+        model_path.parent.mkdir(parents=True, exist_ok=True) # Ensure directory exists
+        
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            # 'loss_fn_state_dict': self.loss_fn.state_dict(), # If loss_fn has learnable parameters
+        }, model_path)
+        
+        joblib.dump(self.dataBase.scaler, scaler_path)
+        print(f"Model and scaler saved to {model_path} and {scaler_path}")
+
+    @staticmethod
+    def load_model(model_class, path, device):
+        checkpoint = torch.load(path, map_location=device)
+        
+        # Determine model_kwargs based on model_class type
+        if model_class == PILSTMNet:
+            model_kwargs = {
+                'input_dim': API.config.NX_LORENZ,
+                'output_dim': API.config.N_LORENZ,
+                'hidden_size': API.config.LSTM_HIDDEN_SIZE,
+                'num_layers': API.config.LSTM_NUM_LAYERS
+            }
+        else:
+            raise ValueError(f"Unknown model class for loading: {model_class}")
+
+        model = model_class(**model_kwargs)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.to(device)
+
+        optimizer = optim.Adam(model.parameters()) # Re-initialize optimizer with model parameters
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # Load scaler
+        # The scaler filename is derived from the model path
+        scaler_name_parts = Path(path).stem.split('_epoch')
+        base_name = scaler_name_parts[0] if len(scaler_name_parts) > 1 else Path(path).stem
+        scaler_path = Path(path).parent / f"{base_name}_scaler.joblib"
+        
+        scaler = joblib.load(scaler_path)
+
+        print(f"Model and scaler loaded from {path}")
+        return model, optimizer, scaler
 
 
 class HybridLoss(nn.Module):
@@ -275,34 +280,65 @@ class HybridLoss(nn.Module):
         self.dt_lorenz = API.config.DT_LORENZ
         self.alpha_pi = API.config.ALPHA_PI
         self.mse_loss = nn.MSELoss()
+        
+        # These will be set by the Coach after DataBase is initialized
+        self.scaler_mean = None
+        self.scaler_scale = None
 
-    def forward(self, predictions, targets, y_current_full_state):
-        # predictions: ŷ(t+1) from the model (batch_size, N_LORENZ)
-        # targets: y(t+1) ground truth (batch_size, N_LORENZ)
-        # y_current_full_state: y(t_i) from the dataset (batch_size, N_LORENZ)
+    def set_scaler_params(self, scaler_mean, scaler_scale, device):
+        self.scaler_mean = torch.tensor(scaler_mean, dtype=torch.float32).to(device)
+        self.scaler_scale = torch.tensor(scaler_scale, dtype=torch.float32).to(device)
 
-        # Data-driven loss L_dd: MSE on observed variables only
-        # We only penalize the first NX_LORENZ variables
-        l_dd = self.mse_loss(predictions[:, :self.nx_lorenz], targets[:, :self.nx_lorenz])
+    def forward(self, predictions_seq, y_segment_targets, y_segment_current_full_states, scaler):
+        # predictions_seq: (batch_size, SEGMENT_LENGTH, N_LORENZ) - network's predictions for y(t+1)
+        # y_segment_targets: (batch_size, SEGMENT_LENGTH, N_LORENZ) - ground truth for y(t+1)
+        # y_segment_current_full_states: (batch_size, SEGMENT_LENGTH, N_LORENZ) - ground truth for y(t)
 
-        # Physics-informed loss L_pi
-        # Approximate dŷ/dt via finite difference: (ỹ(t+1) - ỹ(t_i)) / Δt
-        # Note: predictions is ỹ(t+1), y_current_full_state is ỹ(t_i)
-        dydt_approx = (predictions - y_current_full_state) / self.dt_lorenz
+        if self.scaler_mean is None or self.scaler_scale is None:
+            # This should only happen on the very first call if set_scaler_params wasn't called
+            # Or if the scaler was loaded after HybridLoss was initialized.
+            # For robustness, we can set it here if not already set.
+            self.set_scaler_params(scaler.mean_, scaler.scale_, predictions_seq.device)
 
-        # Calculate f(ŷ) using Lorenz-96 ODE for each item in the batch
-        # We need to apply the ODE function to each row of 'predictions'
-        # Since lorenz_96_ode is a numpy function, we need to convert to numpy and back to tensor.
-        # This might be slow, but for a plan, it outlines the logic.
-        f_y_hat = torch.zeros_like(predictions)
-        for i in range(predictions.shape[0]):
-            # Detach predictions to avoid computing gradients through the ODE function itself
-            # The physics loss penalizes the *output* of the network for not matching the ODE,
-            # not the ODE itself.
-            f_y_hat[i] = torch.tensor(API.tools.lorenz_96_ode(predictions[i].detach().cpu().numpy(), API.config.F_LORENZ), dtype=torch.float32).to(predictions.device)
+        # Data-driven loss (on normalized data)
+        l_dd = self.mse_loss(
+            predictions_seq[:, :, OBS_IDXS],
+            y_segment_targets[:, :, OBS_IDXS]
+        )
 
-        l_pi = self.mse_loss(dydt_approx, f_y_hat)
+        # Physics-informed loss (on denormalized data)
+        # Denormalize predictions_seq (y(t+1)_hat) and y_segment_current_full_states (y(t)_true)
+        predictions_seq_denorm = predictions_seq * self.scaler_scale + self.scaler_mean
+        y_segment_current_full_states_denorm = y_segment_current_full_states * self.scaler_scale + self.scaler_mean
+
+        # Calculate approximate time derivative (dy/dt) from denormalized predictions
+        dydt_approx_denorm = (predictions_seq_denorm - y_segment_current_full_states_denorm) / self.dt_lorenz
+
+        # Calculate f(y) using the denormalized predictions for y(t+1)
+        f_y_hat_denorm = self.lorenz96_torch(predictions_seq_denorm, API.config.F_LORENZ)
+
+        # Normalize the physics residual before computing MSE
+        dydt_approx_norm = dydt_approx_denorm / self.scaler_scale
+        f_y_hat_norm = f_y_hat_denorm / self.scaler_scale
+
+        # Physics-informed loss on normalized residuals
+        l_pi = self.mse_loss(dydt_approx_norm, f_y_hat_norm)
 
         # Total loss
         total_loss = l_dd + self.alpha_pi * l_pi
         return total_loss, l_dd, l_pi
+
+    
+    def lorenz96_torch(self, y, F):
+        """
+        Vectorised Lorenz-96 right-hand side.
+        y : (batch, N)  — any device / dtype
+        F : forcing term
+
+        returns : dy/dt  (same shape)
+        """
+        # always roll along the last (state-variable) axis
+        y_ip1 = torch.roll(y, shifts=-1, dims=-1)  # y_{i+1}
+        y_im1 = torch.roll(y, shifts=1,  dims=-1)  # y_{i-1}
+        y_im2 = torch.roll(y, shifts=2,  dims=-1)  # y_{i-2}
+        return (y_ip1 - y_im2) * y_im1 - y + F
