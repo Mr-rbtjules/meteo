@@ -105,7 +105,7 @@ def plot_pdfs(ground_truth_trajectory, simulated_trajectory, N_variables, fig_di
     print("All PDF plots generated.")
 
 
-def run_closed_loop_and_plot(model, data_base, device, initial_state, num_simulation_steps, fig_dir_suffix):
+def run_closed_loop_and_plot(model, data_base, device, initial_state, num_simulation_steps, model_name_for_dir):
     """
     Runs a closed-loop simulation and plots the PDFs of the state variables.
     """
@@ -118,17 +118,17 @@ def run_closed_loop_and_plot(model, data_base, device, initial_state, num_simula
     print("Closed-loop simulation complete.")
 
     # Plot PDFs
-    print(f"\nGenerating PDF plots for simulation '{fig_dir_suffix}'...")
+    print(f"\nGenerating PDF plots for simulation '{model_name_for_dir}'...")
     plot_pdfs(
         ground_truth_trajectory=data_base.raw_trajectory,
         simulated_trajectory=simulated_trajectory,
         N_variables=API.config.N_LORENZ,
-        fig_dir=Path(API.config.FIG_DIR) / fig_dir_suffix
+        fig_dir=Path(API.config.FIG_DIR) / model_name_for_dir
     )
-    print(f"PDF plots for simulation '{fig_dir_suffix}' generated and saved.")
+    print(f"PDF plots for simulation '{model_name_for_dir}' generated and saved.")
 
 
-def load_or_train_model(data_base, device, num_epochs):
+def load_or_train_model(data_base, device, num_epochs, model_name_to_load=None):
     # Only PILSTMNet is supported
     model_class = API.PILSTMNet
     model_kwargs = {
@@ -138,28 +138,50 @@ def load_or_train_model(data_base, device, num_epochs):
         'num_layers': API.config.LSTM_NUM_LAYERS
     }
 
-    # Create a temporary model instance to get the model name for saving/loading paths
-    temp_model = model_class(**model_kwargs)
-    model_name = API.Coach(temp_model, data_base, device).get_name()
-    model_path = Path(API.config.MODEL_SAVE_DIR) / f"{model_name}_epoch_{num_epochs}.pth"
+    trained_epochs = 0
+    model = None
+    optimizer = None
+    scaler = None
     
-    if model_path.exists():
-        print(f"Loading model from {model_path}...")
-        model, optimizer, scaler = API.Coach.load_model(model_class, model_path, device)
-        # Update data_base's scaler with the loaded one
-        data_base.scaler = scaler 
-        print("Model loaded.")
-    else:
-        print("No saved model found. Starting training...")
+    if model_name_to_load:
+        # Attempt to load a specific model
+        model_path = Path(API.config.MODEL_SAVE_DIR) / f"{model_name_to_load}.pth"
+        if model_path.exists():
+            print(f"Loading model from {model_path} for continued training...")
+            model, optimizer, scaler, trained_epochs = API.Coach.load_model(model_class, model_path, device)
+            data_base.scaler = scaler # Update data_base's scaler with the loaded one
+            print(f"Model loaded. Previously trained for {trained_epochs} epochs.")
+        else:
+            print(f"Model '{model_name_to_load}' not found at {model_path}. Training a new model.")
+    
+    if model is None: # If no model was loaded or if model_name_to_load was None
+        print("Starting training of a new model...")
         model = model_class(**model_kwargs)
         coach = API.Coach(
             dataBase = data_base, 
             device   = device,
             model    = model
         )
-        coach.train(num_epochs=num_epochs)
+        coach.train(num_epochs=num_epochs, start_epoch=0)
         coach.save_model(num_epochs) # Save after training
         model = coach.model # Get the trained model instance
         scaler = data_base.scaler # Get the scaler from the data_base
+        trained_epochs = num_epochs # Total epochs for the new model
+    else: # If a model was loaded, continue training it
+        print(f"Continuing training for an additional {num_epochs} epochs...")
+        coach = API.Coach(
+            dataBase = data_base, 
+            device   = device,
+            model    = model,
+            lr       = optimizer.param_groups[0]['lr'] # Use loaded learning rate
+        )
+        coach.optimizer.load_state_dict(optimizer.state_dict()) # Load optimizer state
+        
+        new_total_epochs = trained_epochs + num_epochs
+        coach.train(num_epochs=new_total_epochs, start_epoch=trained_epochs)
+        coach.save_model(new_total_epochs) # Save with new total epoch count
+        model = coach.model # Get the trained model instance
+        scaler = data_base.scaler # Get the scaler from the data_base
+        trained_epochs = new_total_epochs # Update total epochs
 
-    return model, scaler # Return model and the scaler used for it
+    return model, scaler, trained_epochs # Return model, scaler, and total epochs trained

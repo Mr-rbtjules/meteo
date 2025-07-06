@@ -82,16 +82,17 @@ class Coach:
             worker_init_fn=API.dataBase.worker_init_fn
         )
 
-    def get_name(self):
-        # Generate a unique name for TensorBoard logs based on model and hyperparameters
+    def get_name(self, num_epochs):
+        # Generate a unique name for TensorBoard logs and saved models based on relevant hyperparameters
         return (
-            f"LSTM_N{API.config.N_LORENZ}_Nx{API.config.NX_LORENZ}_F{API.config.F_LORENZ}"
-            f"_dt{API.config.DT_LORENZ}_hsize{API.config.LSTM_HIDDEN_SIZE}_layers{API.config.LSTM_NUM_LAYERS}_alphaPI{API.config.ALPHA_PI}"
+            f"LSTM_alphaPI{API.config.ALPHA_PI}"
+            f"_seqLen{API.config.SEGMENT_LENGTH}"
+            f"_epochs{num_epochs}"
         )
 
-    def train(self, num_epochs=100):
+    def train(self, num_epochs=100, start_epoch=0):
         self.model.train()
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             total_loss_epoch = 0
             total_dd_loss_epoch = 0
             total_pi_loss_epoch = 0
@@ -219,9 +220,9 @@ class Coach:
             
             return simulated_trajectory_original_scale
 
-    def save_model(self, epoch):
-        model_filename = f"{self.get_name()}_epoch_{epoch}.pth"
-        scaler_filename = f"{self.get_name()}_scaler.joblib"
+    def save_model(self, total_epochs_trained):
+        model_filename = f"{self.get_name(total_epochs_trained)}.pth"
+        scaler_filename = f"{self.get_name(total_epochs_trained)}_scaler.joblib"
         
         model_path = Path(API.config.MODEL_SAVE_DIR) / model_filename
         scaler_path = Path(API.config.MODEL_SAVE_DIR) / scaler_filename
@@ -229,7 +230,7 @@ class Coach:
         model_path.parent.mkdir(parents=True, exist_ok=True) # Ensure directory exists
         
         torch.save({
-            'epoch': epoch,
+            'epoch': total_epochs_trained,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             # 'loss_fn_state_dict': self.loss_fn.state_dict(), # If loss_fn has learnable parameters
@@ -262,14 +263,14 @@ class Coach:
         
         # Load scaler
         # The scaler filename is derived from the model path
-        scaler_name_parts = Path(path).stem.split('_epoch')
-        base_name = scaler_name_parts[0] if len(scaler_name_parts) > 1 else Path(path).stem
+        # It's now simpler as the epoch is part of the base name
+        base_name = Path(path).stem
         scaler_path = Path(path).parent / f"{base_name}_scaler.joblib"
         
         scaler = joblib.load(scaler_path)
 
         print(f"Model and scaler loaded from {path}")
-        return model, optimizer, scaler
+        return model, optimizer, scaler, checkpoint['epoch']
 
 
 class HybridLoss(nn.Module):
@@ -290,40 +291,60 @@ class HybridLoss(nn.Module):
         self.scaler_scale = torch.tensor(scaler_scale, dtype=torch.float32).to(device)
 
     def forward(self, predictions_seq, y_segment_targets, y_segment_current_full_states, scaler):
-        # predictions_seq: (batch_size, SEGMENT_LENGTH, N_LORENZ) - network's predictions for y(t+1)
-        # y_segment_targets: (batch_size, SEGMENT_LENGTH, N_LORENZ) - ground truth for y(t+1)
-        # y_segment_current_full_states: (batch_size, SEGMENT_LENGTH, N_LORENZ) - ground truth for y(t)
-
+        """
+        Computes the hybrid loss on physical‑scale (denormalised) quantities:
+        - Data-driven loss (MSE on observed variables, physical scale)
+        - Physics-informed loss (MSE between finite-difference derivative and Lorenz-96 RHS, both physical scale).
+        The y_segment_current_full_states argument is no longer required for the PI term (retained for backwards compatibility).
+        """
         if self.scaler_mean is None or self.scaler_scale is None:
             # This should only happen on the very first call if set_scaler_params wasn't called
             # Or if the scaler was loaded after HybridLoss was initialized.
             # For robustness, we can set it here if not already set.
             self.set_scaler_params(scaler.mean_, scaler.scale_, predictions_seq.device)
 
-        # Data-driven loss (on normalized data)
+        # ---- Denormalise predictions & targets to physical scale ----
+        predictions_seq_denorm = predictions_seq * self.scaler_scale + self.scaler_mean  # (B, S, N)
+        y_segment_targets_denorm = y_segment_targets * self.scaler_scale + self.scaler_mean  # (B, S, N)
+
+        # Data‑driven loss (physical units)
         l_dd = self.mse_loss(
-            predictions_seq[:, :, OBS_IDXS],
-            y_segment_targets[:, :, OBS_IDXS]
+            predictions_seq_denorm[:, :, OBS_IDXS],
+            y_segment_targets_denorm[:, :, OBS_IDXS]
         )
+                # ---- Physics-informed loss (on physical scale) ----
+        # keep: predictions_seq_denorm -> ŷ(t_i+1)
+# Step length is S.  We can only form derivatives for i = 0 … S-2.
+        y_pred_now  = predictions_seq_denorm[:, :-1, :]   # ŷ(t_i)
+        y_pred_next = predictions_seq_denorm[:, 1:,  :]   # ŷ(t_i+1)
 
-        # Physics-informed loss (on denormalized data)
-        # Denormalize predictions_seq (y(t+1)_hat) and y_segment_current_full_states (y(t)_true)
-        predictions_seq_denorm = predictions_seq * self.scaler_scale + self.scaler_mean
-        y_segment_current_full_states_denorm = y_segment_current_full_states * self.scaler_scale + self.scaler_mean
+        dy_dt_pred  = (y_pred_next - y_pred_now) / API.config.DT_LORENZ  # (B, S-1, N)
+        f_y_pred    = self.lorenz96_torch(y_pred_now, API.config.F_LORENZ)
 
-        # Calculate approximate time derivative (dy/dt) from denormalized predictions
-        dydt_approx_denorm = (predictions_seq_denorm - y_segment_current_full_states_denorm) / self.dt_lorenz
+        l_pi = self.mse_loss(dy_dt_pred, f_y_pred)
 
-        # Calculate f(y) using the denormalized predictions for y(t+1)
-        f_y_hat_denorm = self.lorenz96_torch(predictions_seq_denorm, API.config.F_LORENZ)
+        # Finite-difference derivative  (ŷ(t_i+1) − y(t_i)) / Δt
+        
 
-        # Normalize the physics residual before computing MSE
-        dydt_approx_norm = dydt_approx_denorm / self.scaler_scale
-        f_y_hat_norm = f_y_hat_denorm / self.scaler_scale
+        """# ---- Physics‑informed loss (on physical scale) ----
+        
+        # predictions_seq_denorm already available
 
-        # Physics-informed loss on normalized residuals
-        l_pi = self.mse_loss(dydt_approx_norm, f_y_hat_norm)
+        # Finite‑difference time derivative *using consecutive predictions only*
+        # Δŷ/Δt gives an approximation of ẏ(t)
+        dy_dt_approx_denorm = (
+            predictions_seq_denorm[:, 1:, :] - predictions_seq_denorm[:, :-1, :]
+        ) / self.dt_lorenz  # (B, S‑1, N)
 
+        # Evaluate Lorenz‑96 RHS at predicted states ŷ(t)
+        f_y_hat_denorm = self.lorenz96_torch(
+            predictions_seq_denorm[:, :-1, :], API.config.F_LORENZ
+        )  # (B, S‑1, N)
+
+        
+        # Physics-informed loss directly on physical-scale residuals
+        l_pi = self.mse_loss(dy_dt_approx_denorm, f_y_hat_denorm)
+"""
         # Total loss
         total_loss = l_dd + self.alpha_pi * l_pi
         return total_loss, l_dd, l_pi
