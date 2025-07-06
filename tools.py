@@ -17,11 +17,13 @@ def lorenz_96_ode(x, F):
     x: A numpy array of shape (N,) or (batch_size, N) representing the current state.
     F: The forcing parameter.
     """
-    x_minus_1 = np.roll(x, 1, axis=-1) #y_{i-1} , use roll to handle periodic boundary conditions
-    x_plus_1 = np.roll(x, -1, axis=-1) #y_{i+1}
-    x_plus_2 = np.roll(x, -2, axis=-1) #y_{i+2}
-    
-    dxdt = (x_minus_1 - x_plus_2) * x_plus_1 - x + F
+    # Roll to obtain periodic neighbours
+    x_im1 = np.roll(x, 1, axis=-1)   # y_{i-1}
+    x_ip1 = np.roll(x, -1, axis=-1)  # y_{i+1}
+    x_im2 = np.roll(x, 2, axis=-1)   # y_{i-2}
+
+    # Lorenz‑96 RHS: (y_{i+1} − y_{i-2}) * y_{i-1} − y_i + F
+    dxdt = (x_ip1 - x_im2) * x_im1 - x + F
     return dxdt
 
 def simulate_lorenz_96(N, F, dt, num_steps, initial_state=None):

@@ -29,7 +29,7 @@ SEED_TORCH = 7
 TEST_DATA_PROPORTION = 0.2
 BATCH_SIZE = 64 # Batch size for training and validation
 #more than one if non trivial computation in getitem
-NUM_WORKERS = 1
+NUM_WORKERS = 0 #main process
 
 
 M = 10e4
@@ -46,8 +46,8 @@ LSTM_HIDDEN_SIZE = 100
 LSTM_NUM_LAYERS = 1
 LSTM_DROPOUT_RATE = 0.0 # Set dropout to 0 for single-layer LSTM to avoid warning
 
-ALPHA_PI = 1e-2 # Weight for physics-informed loss
-SEGMENT_LENGTH = 200 # Length of trajectory segments for batching = number of sliding windows returned by getitem
+ALPHA_PI = 1e-1 # Weight for physics-informed loss
+SEGMENT_LENGTH = 50 # Length of trajectory segments for batching = number of sliding windows returned by getitem
 
 # Global Model Configuration
 MODEL_TYPE = 'PILSTM' # 'Transformer' or 'PILSTM'

@@ -119,11 +119,13 @@ class DataBase:
             # Prepare LSTM segment indices
             num_lstm_segments = len(normalized_trajectory) - (API.config.SEGMENT_LENGTH + 1)
             all_lstm_segment_start_indices = np.arange(num_lstm_segments)
-
+            # Deterministic train/validation split
+            rng = np.random.RandomState(API.config.SEED_SHUFFLE)
             train_lstm_segment_indices, val_lstm_segment_indices = train_test_split(
                 all_lstm_segment_start_indices,
                 test_size=API.config.TEST_DATA_PROPORTION,
-                random_state=API.config.SEED_SHUFFLE
+                random_state=rng,
+                shuffle=True,
             )
             
             # Save to HDF5
