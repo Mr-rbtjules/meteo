@@ -13,6 +13,10 @@ RAW_DATA_DIR = os.path.join(BASE_DIR, "./data/lorenzData")
 FIG_DIR = os.path.join(BASE_DIR, "./data/figures")
 MODEL_SAVE_DIR = os.path.join(BASE_DIR, "./data/saved_models") # Directory to save trained models
 
+# Learning Rate Scheduler Parameters
+LR_SCHEDULER_PATIENCE = 10 # Number of epochs with no improvement after which learning rate will be reduced
+LR_SCHEDULER_FACTOR = 0.5 # Factor by which the learning rate will be reduced. new_lr = lr * factor
+
 
 
 

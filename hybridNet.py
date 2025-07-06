@@ -5,6 +5,7 @@ import torch # type: ignore
 import torch.nn as nn # type: ignore
 import torch.optim as optim # type: ignore
 import torch.nn.functional as F # type: ignore
+from torch.optim import lr_scheduler # Added import for learning rate scheduler
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader # Added import
 import numpy as np # type: ignore
@@ -44,20 +45,32 @@ class PILSTMNet(nn.Module):
 
 class Coach:
 
-    def __init__(self, model, dataBase, device, lr=1e-3):
+    def __init__(self, model, dataBase, device, lr=1e-3, total_target_epochs=None):
         self.device = device
         self.dataBase = dataBase
         self.model = model.to(self.device)
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         
+        # Initialize learning rate scheduler
+        self.scheduler = lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='min', # Monitor validation loss
+            factor=API.config.LR_SCHEDULER_FACTOR,
+            patience=API.config.LR_SCHEDULER_PATIENCE,
+            verbose=True
+        )
+
         self.loss_fn = API.HybridLoss().to(self.device)
         # Set scaler parameters for HybridLoss after dataBase is initialized
         self.loss_fn.set_scaler_params(self.dataBase.scaler.mean_, self.dataBase.scaler.scale_, self.device)
         
-        log_dir = Path(API.config.LOGS_DIR) / "tensorboard" / self.get_name()
-        log_dir.mkdir(parents=True, exist_ok=True)  # create directory if it doesn't exist
-        self.writer = SummaryWriter(log_dir=str(log_dir))
+        # Only initialize SummaryWriter if total_target_epochs is provided (i.e., for training runs)
+        self.writer = None # Initialize to None
+        if total_target_epochs is not None:
+            log_dir = Path(API.config.LOGS_DIR) / "tensorboard" / self.get_name(total_target_epochs)
+            log_dir.mkdir(parents=True, exist_ok=True)  # create directory if it doesn't exist
+            self.writer = SummaryWriter(log_dir=str(log_dir))
 
         # Conditional dataset and dataloader initialization
         if self.model.model_type == 'PILSTM':
@@ -171,12 +184,14 @@ class Coach:
             
             self.writer.add_scalar('Loss/Validation/Total', avg_val_total_loss, epoch)
             self.writer.add_scalar('Loss/Validation/DataDriven', avg_val_dd_loss, epoch)
-            self.writer.add_scalar('Loss/Validation/PhysicsInformed', avg_val_pi_loss, epoch)
+            # Step the learning rate scheduler
+            self.scheduler.step(avg_val_total_loss)
 
             self.model.train() # Set model back to training mode
             # --- End Validation Loop ---
             
-        self.writer.close()
+        if self.writer: # Only close writer if it was initialized
+            self.writer.close()
         print("Training complete.")
         self.save_model(num_epochs) # Save model after final epoch
 
@@ -233,7 +248,7 @@ class Coach:
             'epoch': total_epochs_trained,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            # 'loss_fn_state_dict': self.loss_fn.state_dict(), # If loss_fn has learnable parameters
+            'scheduler_state_dict': self.scheduler.state_dict(), # Save scheduler state
         }, model_path)
         
         joblib.dump(self.dataBase.scaler, scaler_path)
@@ -261,6 +276,17 @@ class Coach:
         optimizer = optim.Adam(model.parameters()) # Re-initialize optimizer with model parameters
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
+        # Load scheduler state
+        scheduler = lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=API.config.LR_SCHEDULER_FACTOR,
+            patience=API.config.LR_SCHEDULER_PATIENCE,
+            verbose=True
+        )
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
         # Load scaler
         # The scaler filename is derived from the model path
         # It's now simpler as the epoch is part of the base name
@@ -270,7 +296,7 @@ class Coach:
         scaler = joblib.load(scaler_path)
 
         print(f"Model and scaler loaded from {path}")
-        return model, optimizer, scaler, checkpoint['epoch']
+        return model, optimizer, scaler, checkpoint['epoch'], scheduler # Return scheduler
 
 
 class HybridLoss(nn.Module):

@@ -1,4 +1,3 @@
-
 from .config import SEED_NP
 import numpy as np
 from numba import njit  # type: ignore
@@ -109,8 +108,8 @@ def run_closed_loop_and_plot(model, data_base, device, initial_state, num_simula
     """
     Runs a closed-loop simulation and plots the PDFs of the state variables.
     """
-    # Create a temporary coach instance for inference
-    inference_coach = API.Coach(model, data_base, device)
+    # Create a temporary coach instance for inference (do not pass total_target_epochs to prevent SummaryWriter initialization)
+    inference_coach = API.Coach(model, data_base, device, total_target_epochs=None)
     
     # Run closed-loop simulation
     simulated_trajectory = inference_coach.predict_closed_loop(initial_state, num_simulation_steps)
@@ -148,7 +147,7 @@ def load_or_train_model(data_base, device, num_epochs, model_name_to_load=None):
         model_path = Path(API.config.MODEL_SAVE_DIR) / f"{model_name_to_load}.pth"
         if model_path.exists():
             print(f"Loading model from {model_path} for continued training...")
-            model, optimizer, scaler, trained_epochs = API.Coach.load_model(model_class, model_path, device)
+            model, optimizer, scaler, trained_epochs, scheduler = API.Coach.load_model(model_class, model_path, device)
             data_base.scaler = scaler # Update data_base's scaler with the loaded one
             print(f"Model loaded. Previously trained for {trained_epochs} epochs.")
         else:
@@ -160,7 +159,8 @@ def load_or_train_model(data_base, device, num_epochs, model_name_to_load=None):
         coach = API.Coach(
             dataBase = data_base, 
             device   = device,
-            model    = model
+            model    = model,
+            total_target_epochs = num_epochs # Pass num_epochs for new training
         )
         coach.train(num_epochs=num_epochs, start_epoch=0)
         coach.save_model(num_epochs) # Save after training
@@ -169,15 +169,17 @@ def load_or_train_model(data_base, device, num_epochs, model_name_to_load=None):
         trained_epochs = num_epochs # Total epochs for the new model
     else: # If a model was loaded, continue training it
         print(f"Continuing training for an additional {num_epochs} epochs...")
+        new_total_epochs = trained_epochs + num_epochs
         coach = API.Coach(
             dataBase = data_base, 
             device   = device,
             model    = model,
-            lr       = optimizer.param_groups[0]['lr'] # Use loaded learning rate
+            lr       = optimizer.param_groups[0]['lr'], # Use loaded learning rate
+            total_target_epochs = new_total_epochs # Pass new_total_epochs for continued training
         )
         coach.optimizer.load_state_dict(optimizer.state_dict()) # Load optimizer state
+        coach.scheduler.load_state_dict(scheduler.state_dict()) # Load scheduler state
         
-        new_total_epochs = trained_epochs + num_epochs
         coach.train(num_epochs=new_total_epochs, start_epoch=trained_epochs)
         coach.save_model(new_total_epochs) # Save with new total epoch count
         model = coach.model # Get the trained model instance
