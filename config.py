@@ -46,8 +46,16 @@ LSTM_HIDDEN_SIZE = 100
 LSTM_NUM_LAYERS = 1
 LSTM_DROPOUT_RATE = 0.0 # Set dropout to 0 for single-layer LSTM to avoid warning
 
-ALPHA_PI = 1e-1 # Weight for physics-informed loss
-SEGMENT_LENGTH = 50 # Length of trajectory segments for batching = number of sliding windows returned by getitem
+ALPHA_PI = 1e-2 # Weight for physics-informed loss
+SEGMENT_LENGTH = 200 # Length of trajectory segments for batching = number of sliding windows returned by getitem
+
+# Transformer Parameters
+TRANSFORMER_NUM_ENCODER_LAYERS = 2
+TRANSFORMER_NUM_DECODER_LAYERS = 2
+TRANSFORMER_NUM_HEADS = 4
+TRANSFORMER_MODEL_DIM = 28
+TRANSFORMER_FF_DIM = 112
+TRANSFORMER_DROPOUT_RATE = 0.1
 
 # Global Model Configuration
 MODEL_TYPE = 'PILSTM' # 'Transformer' or 'PILSTM'

@@ -110,8 +110,16 @@ def run_closed_loop_and_plot(model, data_base, device, initial_state, num_simula
     """
     Runs a closed-loop simulation and plots the PDFs of the state variables.
     """
+    # Select the appropriate coach class based on the model type
+    if model.model_type == 'PILSTM':
+        coach_class = API.Coach
+    elif model.model_type == 'Transformer':
+        coach_class = API.TFCoach
+    else:
+        raise ValueError(f"Unknown model type: {model.model_type}")
+
     # Create a temporary coach instance for inference (do not pass total_target_epochs to prevent SummaryWriter initialization)
-    inference_coach = API.Coach(model, data_base, device, total_target_epochs=None)
+    inference_coach = coach_class(model, data_base, device, total_target_epochs=None)
     
     # Run closed-loop simulation
     simulated_trajectory = inference_coach.predict_closed_loop(initial_state, num_simulation_steps)
@@ -130,62 +138,96 @@ def run_closed_loop_and_plot(model, data_base, device, initial_state, num_simula
 
 
 def load_or_train_model(data_base, device, num_epochs, model_name_to_load=None):
-    # Only PILSTMNet is supported
-    model_class = API.PILSTMNet
-    model_kwargs = {
-        'input_dim': API.config.NX_LORENZ,
-        'output_dim': API.config.N_LORENZ,
-        'hidden_size': API.config.LSTM_HIDDEN_SIZE,
-        'num_layers': API.config.LSTM_NUM_LAYERS
-    }
+    model_class = None
+    model_kwargs = {}
+    coach_class = None
+
+    if API.config.MODEL_TYPE == 'PILSTM':
+        model_class = API.PILSTMNet
+        coach_class = API.Coach
+        model_kwargs = {
+            'input_dim': API.config.NX_LORENZ,
+            'output_dim': API.config.N_LORENZ,
+            'hidden_size': API.config.LSTM_HIDDEN_SIZE,
+            'num_layers': API.config.LSTM_NUM_LAYERS
+        }
+    elif API.config.MODEL_TYPE == 'Transformer':
+        model_class = API.TransformerNet
+        coach_class = API.TFCoach
+        if API.config.TRANSFORMER_CONFIG == 'SMALL':
+            model_kwargs = {
+                'input_dim': API.config.NX_LORENZ,
+                'output_dim': API.config.N_LORENZ,
+                'd_model': API.config.TRANSFORMER_MODEL_DIM_SMALL,
+                'num_heads': API.config.TRANSFORMER_NUM_HEADS_SMALL,
+                'num_encoder_layers': API.config.TRANSFORMER_NUM_ENCODER_LAYERS_SMALL,
+                'num_decoder_layers': API.config.TRANSFORMER_NUM_DECODER_LAYERS_SMALL,
+                'd_ff': API.config.TRANSFORMER_FF_DIM_SMALL,
+                'dropout_rate': API.config.TRANSFORMER_DROPOUT_RATE
+            }
+        elif API.config.TRANSFORMER_CONFIG == 'COMPLEX':
+            model_kwargs = {
+                'input_dim': API.config.NX_LORENZ,
+                'output_dim': API.config.N_LORENZ,
+                'd_model': API.config.TRANSFORMER_MODEL_DIM_COMPLEX,
+                'num_heads': API.config.TRANSFORMER_NUM_HEADS_COMPLEX,
+                'num_encoder_layers': API.config.TRANSFORMER_NUM_ENCODER_LAYERS_COMPLEX,
+                'num_decoder_layers': API.config.TRANSFORMER_NUM_DECODER_LAYERS_COMPLEX,
+                'd_ff': API.config.TRANSFORMER_FF_DIM_COMPLEX,
+                'dropout_rate': API.config.TRANSFORMER_DROPOUT_RATE
+            }
+        else:
+            raise ValueError(f"Unknown Transformer configuration: {API.config.TRANSFORMER_CONFIG}")
+    else:
+        raise ValueError(f"Unknown model type: {API.config.MODEL_TYPE}")
 
     trained_epochs = 0
     model = None
     optimizer = None
     scaler = None
+    scheduler = None
     
     if model_name_to_load:
-        # Attempt to load a specific model
         model_path = Path(API.config.MODEL_SAVE_DIR) / f"{model_name_to_load}.pth"
         if model_path.exists():
             print(f"Loading model from {model_path} for continued training...")
-            model, optimizer, scaler, trained_epochs, scheduler = API.Coach.load_model(model_class, model_path, device)
-            data_base.scaler = scaler # Update data_base's scaler with the loaded one
+            model, optimizer, scaler, trained_epochs, scheduler = coach_class.load_model(model_class, model_path, device)
+            data_base.scaler = scaler
             print(f"Model loaded. Previously trained for {trained_epochs} epochs.")
         else:
             print(f"Model '{model_name_to_load}' not found at {model_path}. Training a new model.")
     
-    if model is None: # If no model was loaded or if model_name_to_load was None
-        print("Starting training of a new model...")
+    if model is None:
+        print(f"Starting training of a new {API.config.MODEL_TYPE} model...")
         model = model_class(**model_kwargs)
-        coach = API.Coach(
+        coach = coach_class(
             dataBase = data_base, 
             device   = device,
             model    = model,
-            total_target_epochs = num_epochs # Pass num_epochs for new training
+            total_target_epochs = num_epochs
         )
         coach.train(num_epochs=num_epochs, start_epoch=0)
-        coach.save_model(num_epochs) # Save after training
-        model = coach.model # Get the trained model instance
-        scaler = data_base.scaler # Get the scaler from the data_base
-        trained_epochs = num_epochs # Total epochs for the new model
-    else: # If a model was loaded, continue training it
+        coach.save_model(num_epochs)
+        model = coach.model
+        scaler = data_base.scaler
+        trained_epochs = num_epochs
+    else:
         print(f"Continuing training for an additional {num_epochs} epochs...")
         new_total_epochs = trained_epochs + num_epochs
-        coach = API.Coach(
+        coach = coach_class(
             dataBase = data_base, 
             device   = device,
             model    = model,
-            lr       = optimizer.param_groups[0]['lr'], # Use loaded learning rate
-            total_target_epochs = new_total_epochs # Pass new_total_epochs for continued training
+            lr       = optimizer.param_groups[0]['lr'],
+            total_target_epochs = new_total_epochs
         )
-        coach.optimizer.load_state_dict(optimizer.state_dict()) # Load optimizer state
-        coach.scheduler.load_state_dict(scheduler.state_dict()) # Load scheduler state
+        coach.optimizer.load_state_dict(optimizer.state_dict())
+        coach.scheduler.load_state_dict(scheduler.state_dict())
         
         coach.train(num_epochs=new_total_epochs, start_epoch=trained_epochs)
-        coach.save_model(new_total_epochs) # Save with new total epoch count
-        model = coach.model # Get the trained model instance
-        scaler = data_base.scaler # Get the scaler from the data_base
-        trained_epochs = new_total_epochs # Update total epochs
+        coach.save_model(new_total_epochs)
+        model = coach.model
+        scaler = data_base.scaler
+        trained_epochs = new_total_epochs
 
-    return model, scaler, trained_epochs # Return model, scaler, and total epochs trained
+    return model, scaler, trained_epochs
